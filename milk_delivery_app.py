@@ -161,6 +161,30 @@ def init_db():
     """)
 
     c.execute("""
+        CREATE TABLE IF NOT EXISTS cash_collections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            rider_id INTEGER NOT NULL,
+            customer_id INTEGER,
+            amount REAL NOT NULL,
+            note TEXT,
+            timestamp TEXT NOT NULL,
+            FOREIGN KEY(rider_id) REFERENCES riders(id),
+            FOREIGN KEY(customer_id) REFERENCES customers(id)
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS cash_settlements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            rider_id INTEGER NOT NULL,
+            amount REAL NOT NULL,
+            note TEXT,
+            timestamp TEXT NOT NULL,
+            FOREIGN KEY(rider_id) REFERENCES riders(id)
+        )
+    """)
+
+    c.execute("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
@@ -347,6 +371,53 @@ def get_notifications(audience, customer_id=None, limit=20):
     return [dict(r) for r in rows]
 
 
+# ----------------------------- RIDER CASH RECOVERY -----------------------------
+
+def rider_cash_in_hand(rider_id: int) -> float:
+    """Real-time cash a rider is currently holding: everything collected minus everything settled."""
+    conn = get_conn()
+    collected = conn.execute(
+        "SELECT COALESCE(SUM(amount),0) AS s FROM cash_collections WHERE rider_id=?", (rider_id,)
+    ).fetchone()["s"]
+    settled = conn.execute(
+        "SELECT COALESCE(SUM(amount),0) AS s FROM cash_settlements WHERE rider_id=?", (rider_id,)
+    ).fetchone()["s"]
+    conn.close()
+    return round(collected - settled, 2)
+
+
+def record_cash_collection(rider_id: int, customer_id, amount: float, note: str = ""):
+    """Rider collects cash from a customer on the spot. This both reduces the
+    customer's khata balance (payments table) and adds to the rider's cash-in-hand
+    (cash_collections table) until the rider settles up with the owner."""
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO cash_collections (rider_id,customer_id,amount,note,timestamp) VALUES (?,?,?,?,?)",
+        (rider_id, customer_id, amount, note, datetime.now().isoformat())
+    )
+    if customer_id:
+        conn.execute(
+            "INSERT INTO payments (customer_id,payment_date,amount,method,note,timestamp) VALUES (?,?,?,?,?,?)",
+            (customer_id, date.today().isoformat(), amount, "cash", note or "رائیڈر نے موقع پر وصول کیا", datetime.now().isoformat())
+        )
+    conn.commit()
+    conn.close()
+    if customer_id:
+        push_notification(customer_id, f"آپ کی Rs {amount:.0f} نقد وصولی رائیڈر کے ذریعے درج ہو گئی", audience="customer")
+
+
+def settle_rider_cash(rider_id: int, amount: float, note: str = ""):
+    """Owner/admin receives cash physically handed over by the rider. Reduces that
+    rider's cash-in-hand by `amount` (pass the full current amount to zero it out)."""
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO cash_settlements (rider_id,amount,note,timestamp) VALUES (?,?,?,?)",
+        (rider_id, amount, note, datetime.now().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+
 # ----------------------------- DELIVERY (CONFIRM) -----------------------------
 
 def confirm_delivery(customer_id, rider_id, quantity_kg, rate, verified_via, status="delivered"):
@@ -472,7 +543,11 @@ def rider_panel(user):
         if key not in st.session_state:
             st.session_state[key] = default
 
-    tab_scan, tab_deliver, tab_history = st.tabs(["📷 اسکین / کسٹمر منتخب کریں", "➕ ڈیلیوری ایڈ کریں", "📋 آج کی ہسٹری"])
+    st.metric("💵 آپ کے پاس موجود نقدی (Cash in Hand)", f"Rs {rider_cash_in_hand(rider['id']):.0f}")
+
+    tab_scan, tab_deliver, tab_cash, tab_history = st.tabs(
+        ["📷 اسکین / کسٹمر منتخب کریں", "➕ ڈیلیوری ایڈ کریں", "💵 کیش کلیکشن", "📋 آج کی ہسٹری"]
+    )
 
     with tab_scan:
         st.subheader("کسٹمر منتخب کریں")
@@ -490,6 +565,9 @@ def rider_panel(user):
                         st.session_state.selected_customer = cust
                         st.session_state.delivery_verified = False
                         st.success(f"کسٹمر تصدیق ہو گیا: {cust['name']}")
+                        if not cust.get("pin_hash"):
+                            generate_otp(cust["id"])
+                            st.info("کسٹمر کی اسکرین پر 4-digit OTP بھیج دیا گیا — کسٹمر سے کوڈ پوچھیں۔")
                     else:
                         st.error("QR کسی کسٹمر سے میچ نہیں ہوا (invalid / expired token)۔")
                 else:
@@ -588,6 +666,43 @@ def rider_panel(user):
                 mark_missed(cust["id"], rider["id"])
                 st.success("ناغہ درج کر دیا گیا اور کسٹمر/اونر کو مطلع کر دیا گیا۔")
 
+    with tab_cash:
+        st.subheader("💵 کسٹمر سے نقد وصولی درج کریں")
+        st.caption(f"موجودہ نقدی آپ کے پاس: Rs {rider_cash_in_hand(rider['id']):.0f}")
+        customers = get_customers()
+        if customers:
+            names = [f"{c['name']} (بقیہ Rs {customer_balance(c['id']):.0f})" for c in customers]
+            idx = st.selectbox("کسٹمر", range(len(names)), format_func=lambda i: names[i], key="cash_cust_select")
+            amt = st.number_input("وصول شدہ رقم", min_value=0.0, step=50.0, key="cash_amt")
+            note = st.text_input("نوٹ (اختیاری)", key="cash_note")
+            if st.button("💰 نقد وصولی درج کریں", type="primary"):
+                if amt > 0:
+                    record_cash_collection(rider["id"], customers[idx]["id"], amt, note)
+                    st.success(f"Rs {amt:.0f} نقد وصولی درج ہو گئی — کسٹمر کا کھاتہ اپڈیٹ ہو گیا اور آپ کی نقدی میں شامل ہو گئی۔")
+                    st.rerun()
+                else:
+                    st.error("رقم درج کریں۔")
+        else:
+            st.caption("کوئی کسٹمر موجود نہیں۔")
+
+        st.divider()
+        st.subheader("آج کی کیش کلیکشن ہسٹری")
+        today = date.today().isoformat()
+        conn = get_conn()
+        crows = conn.execute(
+            "SELECT cc.*, c.name AS customer_name FROM cash_collections cc "
+            "LEFT JOIN customers c ON c.id=cc.customer_id "
+            "WHERE cc.rider_id=? AND cc.timestamp LIKE ? ORDER BY cc.timestamp DESC",
+            (rider["id"], f"{today}%")
+        ).fetchall()
+        conn.close()
+        if crows:
+            dfc = pd.DataFrame([dict(r) for r in crows])[["timestamp", "customer_name", "amount", "note"]]
+            dfc.columns = ["وقت", "کسٹمر", "رقم", "نوٹ"]
+            st.dataframe(dfc, use_container_width=True, hide_index=True)
+        else:
+            st.caption("آج ابھی تک کوئی نقد وصولی درج نہیں ہوئی۔")
+
     with tab_history:
         today = date.today().isoformat()
         conn = get_conn()
@@ -613,7 +728,7 @@ def admin_panel(user):
 
     tabs = st.tabs([
         "📡 لائیو ٹریکنگ", "💰 ریٹ مینجمنٹ", "👥 کسٹمرز", "🛵 رائیڈرز",
-        "📒 کھاتہ / لیجر", "💵 وصولی درج کریں"
+        "📒 کھاتہ / لیجر", "💵 وصولی درج کریں", "🧾 کیش سیٹلمنٹ"
     ])
 
     # ---- Live tracking + admin notifications ----
@@ -849,6 +964,56 @@ def admin_panel(user):
         else:
             st.caption("پہلے کسٹمر شامل کریں۔")
 
+    # ---- Cash Settlement / Recovery ----
+    with tabs[6]:
+        st.subheader("🧾 رائیڈرز کی نقدی (Cash in Hand)")
+        conn = get_conn()
+        riders = [dict(r) for r in conn.execute("SELECT * FROM riders WHERE active=1").fetchall()]
+        conn.close()
+
+        if riders:
+            rows_display = [{"رائیڈر": r["name"], "موجودہ نقدی (Rs)": rider_cash_in_hand(r["id"])} for r in riders]
+            st.dataframe(pd.DataFrame(rows_display), use_container_width=True, hide_index=True)
+
+            st.divider()
+            st.subheader("💰 نقدی وصول کریں (Settlement)")
+            names = [r["name"] for r in riders]
+            sel = st.selectbox("رائیڈر منتخب کریں", range(len(names)), format_func=lambda i: names[i], key="settle_rider")
+            rider = riders[sel]
+            in_hand = rider_cash_in_hand(rider["id"])
+            st.caption(f"{rider['name']} کے پاس موجود نقدی: Rs {in_hand:.0f}")
+
+            with st.form("settle_cash_form"):
+                settle_amt = st.number_input("وصول کی جانے والی رقم", min_value=0.0, value=float(max(in_hand, 0.0)), step=50.0)
+                settle_note = st.text_input("نوٹ (اختیاری)")
+                submitted = st.form_submit_button("✅ وصول کریں اور کیش ان ہینڈ اپڈیٹ کریں")
+                if submitted:
+                    if settle_amt <= 0:
+                        st.error("رقم درج کریں۔")
+                    elif settle_amt > in_hand:
+                        st.error(f"یہ رقم رائیڈر کے پاس موجود نقدی (Rs {in_hand:.0f}) سے زیادہ ہے۔")
+                    else:
+                        settle_rider_cash(rider["id"], settle_amt, settle_note)
+                        st.success(f"Rs {settle_amt:.0f} وصول کر لی گئی۔ {rider['name']} کی باقی نقدی: Rs {in_hand - settle_amt:.0f}")
+                        st.rerun()
+
+            st.divider()
+            st.subheader("سیٹلمنٹ ہسٹری")
+            conn = get_conn()
+            hist = conn.execute(
+                "SELECT cs.*, r.name AS rider_name FROM cash_settlements cs "
+                "JOIN riders r ON r.id=cs.rider_id ORDER BY cs.timestamp DESC LIMIT 50"
+            ).fetchall()
+            conn.close()
+            if hist:
+                dfh = pd.DataFrame([dict(r) for r in hist])[["timestamp", "rider_name", "amount", "note"]]
+                dfh.columns = ["وقت", "رائیڈر", "رقم", "نوٹ"]
+                st.dataframe(dfh, use_container_width=True, hide_index=True)
+            else:
+                st.caption("ابھی تک کوئی سیٹلمنٹ نہیں ہوئی۔")
+        else:
+            st.caption("پہلے رائیڈر شامل کریں۔")
+
 
 # ----------------------------- CUSTOMER PANEL -----------------------------
 
@@ -862,12 +1027,29 @@ def customer_panel(user):
     cust = dict(cust)
 
     st.header(f"👤 خوش آمدید، {cust['name']}")
-    rate = float(get_setting("rate_per_kg", "250"))
-    st.info(f"آج کا ریٹ: **Rs {rate:.0f} / kg**")
 
-    pending_otp = get_pending_otp(cust["id"])
-    if pending_otp:
-        st.warning(f"🔑 لائیو OTP (رائیڈر کو بتائیں): **{pending_otp['otp']}** — میعاد {pending_otp['expires_at'][11:16]} تک")
+    col_rate, col_qr = st.columns([2, 1])
+    with col_rate:
+        rate = float(get_setting("rate_per_kg", "250"))
+        st.info(f"آج کا ریٹ: **Rs {rate:.0f} / kg**")
+
+        pending_otp = get_pending_otp(cust["id"])
+        if pending_otp:
+            st.warning(f"🔑 لائیو OTP (رائیڈر کو بتائیں): **{pending_otp['otp']}** — میعاد {pending_otp['expires_at'][11:16]} تک")
+
+    with col_qr:
+        st.markdown("**📱 آپ کا QR کوڈ**")
+        token = cust.get("qr_token")
+        if not token and CRYPTO_AVAILABLE:
+            token = generate_customer_qr_token(cust["id"])
+            cust["qr_token"] = token
+        if QR_AVAILABLE and token:
+            qr_img = qrcode.make(token)
+            buf = io.BytesIO()
+            qr_img.save(buf, format="PNG")
+            st.image(buf.getvalue(), width=150, caption="رائیڈر کو یہ دکھائیں")
+        else:
+            st.caption(f"آپ کا شناختی کوڈ: `{cust['code']}`")
 
     month = date.today().strftime("%Y-%m")
     conn = get_conn()
