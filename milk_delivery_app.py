@@ -96,6 +96,7 @@ def init_db():
     # migrations for existing DBs
     _add_column_if_missing(conn, "customers", "qr_token TEXT")
     _add_column_if_missing(conn, "customers", "pin_hash TEXT")
+    _add_column_if_missing(conn, "customers", "pin_plain TEXT")
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS riders (
@@ -287,7 +288,7 @@ def verify_customer_qr(scanned_data: str):
 
 def set_customer_pin(customer_id: int, pin: str):
     conn = get_conn()
-    conn.execute("UPDATE customers SET pin_hash=? WHERE id=?", (hash_pw(pin), customer_id))
+    conn.execute("UPDATE customers SET pin_hash=?, pin_plain=? WHERE id=?", (hash_pw(pin), pin, customer_id))
     conn.commit()
     conn.close()
 
@@ -369,6 +370,50 @@ def get_notifications(audience, customer_id=None, limit=20):
         ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+# ----------------------------- LIVE PIN POPUP (customer screen) -----------------------------
+# Streamlit has no real push channel, so "within a second" is approximated by polling:
+# a fragment that reruns every ~2s (or, on older Streamlit without fragments, a meta-refresh)
+# picks up a freshly-generated OTP almost immediately and pops it up.
+
+if hasattr(st, "dialog"):
+    @st.dialog("🔑 نیا ڈیلیوری تصدیقی PIN")
+    def _otp_dialog(otp, expires_label):
+        st.markdown(f"# {otp}")
+        st.caption(f"میعاد: {expires_label} تک")
+        st.info("یہ کوڈ رائیڈر کو بتائیں تاکہ ڈیلیوری کنفرم ہو سکے۔")
+else:
+    def _otp_dialog(otp, expires_label):
+        pass  # older Streamlit without modal support — the banner below still shows it
+
+
+def _render_customer_live_pin(cust_id):
+    conn = get_conn()
+    row = conn.execute("SELECT pin_plain FROM customers WHERE id=?", (cust_id,)).fetchone()
+    conn.close()
+
+    pending = get_pending_otp(cust_id)
+    if pending:
+        if st.session_state.get("last_seen_otp") != pending["otp"]:
+            st.session_state["last_seen_otp"] = pending["otp"]
+            _otp_dialog(pending["otp"], pending["expires_at"][11:16])
+        st.warning(f"🔑 لائیو تصدیقی PIN: **{pending['otp']}** — میعاد {pending['expires_at'][11:16]} تک — یہ رائیڈر کو بتائیں۔")
+
+    if row and row["pin_plain"]:
+        st.caption(f"📴 آف لائن / اسٹیٹک PIN (نیٹ ورک نہ ہونے پر یہی بتائیں): **{row['pin_plain']}**")
+    else:
+        st.caption("⚠️ آپ نے ابھی آف لائن PIN سیٹ نہیں کیا — نیچے 'PIN سیٹ کریں' سیکشن سے سیٹ کر لیں تاکہ نیٹ نہ ہونے پر بھی ڈیلیوری کنفرم ہو سکے۔")
+
+
+if hasattr(st, "fragment"):
+    @st.fragment(run_every=2)
+    def live_pin_widget(cust_id):
+        _render_customer_live_pin(cust_id)
+else:
+    def live_pin_widget(cust_id):
+        st.markdown('<meta http-equiv="refresh" content="3">', unsafe_allow_html=True)
+        _render_customer_live_pin(cust_id)
 
 
 # ----------------------------- RIDER CASH RECOVERY -----------------------------
@@ -619,44 +664,40 @@ def rider_panel(user):
                 total_amount = total_qty * rate
                 st.markdown(f"**کل مقدار: {total_qty} kg — کل رقم: Rs {total_amount:.0f}**")
 
-                st.markdown("#### 🔐 کسٹمر تصدیق (PIN Authentication)")
+                st.markdown("#### 🔐 Enter Customer PIN")
                 has_pin = bool(cust.get("pin_hash"))
 
                 if st.session_state.delivery_verified:
-                    st.success(f"تصدیق مکمل ✅ ({st.session_state.verified_via})")
-                elif has_pin:
-                    pin_input = st.text_input("کسٹمر کا 4-digit PIN درج کریں", max_chars=4, type="password", key="pin_field")
-                    if st.button("PIN تصدیق کریں"):
+                    st.success(f"تصدیق مکمل — ٹرانزیکشن لاک ✅ ({st.session_state.verified_via})")
+                else:
+                    pin_input = st.text_input("کسٹمر سے PIN لے کر یہاں درج کریں", max_chars=4, type="password", key="pin_field")
+                    if st.button("✔️ PIN تصدیق کریں", type="primary"):
                         if verify_static_pin(cust["id"], pin_input):
                             st.session_state.delivery_verified = True
                             st.session_state.verified_via = "Static PIN"
                             st.rerun()
-                        else:
-                            st.error("غلط PIN۔ دوبارہ کوشش کریں۔")
-                else:
-                    pending = get_pending_otp(cust["id"])
-                    col_a, col_b = st.columns(2)
-                    if col_a.button("📤 کسٹمر کو OTP بھیجیں"):
-                        generate_otp(cust["id"])
-                        st.info(f"OTP کسٹمر کے پینل/نمبر پر بھیج دیا گیا ({OTP_VALID_MINUTES} منٹ کے لیے) — کسٹمر سے کوڈ پوچھیں۔")
-                        st.rerun()
-                    otp_input = col_b.text_input("OTP درج کریں", max_chars=4, key="otp_field")
-                    if pending:
-                        st.caption(f"OTP فعال ہے، میعاد: {pending['expires_at'][11:16]}")
-                    if st.button("OTP تصدیق کریں"):
-                        if verify_otp(cust["id"], otp_input):
+                        elif verify_otp(cust["id"], pin_input):
                             st.session_state.delivery_verified = True
                             st.session_state.verified_via = "OTP"
                             st.rerun()
                         else:
-                            st.error("غلط یا میعاد ختم OTP۔")
+                            st.error("غلط PIN۔ دوبارہ کوشش کریں۔")
+
+                    if not has_pin:
+                        pending = get_pending_otp(cust["id"])
+                        if pending:
+                            st.caption(f"OTP کسٹمر کی اسکرین پر پہلے سے موجود ہے، میعاد: {pending['expires_at'][11:16]}")
+                        if st.button("📤 نیا OTP کسٹمر کو بھیجیں"):
+                            generate_otp(cust["id"])
+                            st.info(f"نیا OTP کسٹمر کے پینل پر بھیج دیا گیا ({OTP_VALID_MINUTES} منٹ کے لیے)۔")
+                            st.rerun()
 
                 if st.button("✅ ڈیلیوری کنفرم کریں", type="primary", disabled=not st.session_state.delivery_verified):
                     confirm_delivery(cust["id"], rider["id"], total_qty, rate, st.session_state.verified_via)  # /confirm-delivery
                     st.session_state.cart = []
                     st.session_state.delivery_verified = False
                     st.session_state.verified_via = None
-                    st.success("ڈیلیوری محفوظ ہو گئی اور کسٹمر/اونر کو نوٹیفکیشن بھیج دی گئی ✅")
+                    st.success("ڈیلیوری محفوظ ہو گئی، ٹرانزیکشن لاک، اور کسٹمر/اونر کو سنک نوٹیفکیشن بھیج دی گئی ✅")
                     st.rerun()
             else:
                 st.caption("اوپر بٹن دبا کر مقدار شامل کریں۔")
@@ -1032,10 +1073,7 @@ def customer_panel(user):
     with col_rate:
         rate = float(get_setting("rate_per_kg", "250"))
         st.info(f"آج کا ریٹ: **Rs {rate:.0f} / kg**")
-
-        pending_otp = get_pending_otp(cust["id"])
-        if pending_otp:
-            st.warning(f"🔑 لائیو OTP (رائیڈر کو بتائیں): **{pending_otp['otp']}** — میعاد {pending_otp['expires_at'][11:16]} تک")
+        live_pin_widget(cust["id"])
 
     with col_qr:
         st.markdown("**📱 آپ کا QR کوڈ**")
@@ -1100,13 +1138,14 @@ def customer_panel(user):
     else:
         st.caption("کوئی نوٹیفکیشن نہیں۔")
 
-    with st.expander("🔐 اپنا PIN سیٹ / تبدیل کریں"):
-        st.caption("PIN سیٹ کرنے پر رائیڈر کو ہر بار OTP بھیجنے کی ضرورت نہیں رہے گی — رائیڈر یہی PIN مانگے گا۔")
+    with st.expander("🔐 اپنا آف لائن / اسٹیٹک PIN سیٹ یا تبدیل کریں", expanded=not cust.get("pin_plain")):
+        st.caption("یہ PIN سیٹ کریں تاکہ نیٹ ورک نہ ہونے کی صورت میں بھی آپ رائیڈر کو کوڈ بتا کر ڈیلیوری کنفرم کروا سکیں — سیٹ ہونے کے بعد یہ ہمیشہ اوپر دکھتا رہے گا۔")
         new_pin = st.text_input("نیا 4-digit PIN", max_chars=4, type="password", key="cust_new_pin")
         if st.button("PIN محفوظ کریں"):
             if new_pin and len(new_pin) == 4 and new_pin.isdigit():
                 set_customer_pin(cust["id"], new_pin)
                 st.success("PIN محفوظ ہو گیا۔")
+                st.rerun()
             else:
                 st.error("PIN بالکل 4 ہندسوں کا ہونا چاہیے۔")
 
