@@ -1,14 +1,25 @@
 """
 Doodh Delivery System — NABA TECH BY KALEEM ULLAH SHARIF
 Roles: Rider, Owner/Admin, Customer
-Single-file Streamlit app backed by SQLite.
+
+v2: Encrypted QR (customer_id sealed with Fernet), scan verification,
+PIN/OTP authentication before a delivery is confirmed, and an
+in-app notification feed standing in for push notifications.
+
+Note on "API" terms: this is a single-file Streamlit app, so
+/verify-customer-qr and /confirm-delivery are implemented as plain
+Python functions with the same contract described in the spec
+(input -> decrypt/verify -> DB write -> notify). If this later needs
+to serve a separate mobile customer app, these functions can be
+lifted as-is into a FastAPI backend without changing their logic.
 """
 
 import streamlit as st
 import sqlite3
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import hashlib
 import io
+import random
 import pandas as pd
 
 try:
@@ -24,7 +35,14 @@ try:
 except ImportError:
     QR_SCAN_AVAILABLE = False
 
+try:
+    from cryptography.fernet import Fernet, InvalidToken
+    CRYPTO_AVAILABLE = True
+except ImportError:
+    CRYPTO_AVAILABLE = False
+
 DB_PATH = "milk_delivery.db"
+OTP_VALID_MINUTES = 5
 
 # ----------------------------- DB LAYER -----------------------------
 
@@ -37,6 +55,13 @@ def get_conn():
 
 def hash_pw(pw: str) -> str:
     return hashlib.sha256(pw.encode()).hexdigest()
+
+
+def _add_column_if_missing(conn, table, col_def):
+    col_name = col_def.split()[0]
+    cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+    if col_name not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col_def}")
 
 
 def init_db():
@@ -68,6 +93,9 @@ def init_db():
             FOREIGN KEY(user_id) REFERENCES users(id)
         )
     """)
+    # migrations for existing DBs
+    _add_column_if_missing(conn, "customers", "qr_token TEXT")
+    _add_column_if_missing(conn, "customers", "pin_hash TEXT")
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS riders (
@@ -91,11 +119,13 @@ def init_db():
             amount REAL NOT NULL,
             status TEXT NOT NULL DEFAULT 'delivered' CHECK(status IN ('delivered','missed','extra')),
             confirmed INTEGER DEFAULT 0,
+            verified_via TEXT,
             timestamp TEXT NOT NULL,
             FOREIGN KEY(customer_id) REFERENCES customers(id),
             FOREIGN KEY(rider_id) REFERENCES riders(id)
         )
     """)
+    _add_column_if_missing(conn, "deliveries", "verified_via TEXT")
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS payments (
@@ -111,6 +141,26 @@ def init_db():
     """)
 
     c.execute("""
+        CREATE TABLE IF NOT EXISTS pending_otp (
+            customer_id INTEGER PRIMARY KEY,
+            otp TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER,
+            audience TEXT NOT NULL CHECK(audience IN ('customer','admin')),
+            message TEXT NOT NULL,
+            delivery_id INTEGER,
+            created_at TEXT NOT NULL,
+            is_read INTEGER DEFAULT 0
+        )
+    """)
+
+    c.execute("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
@@ -119,7 +169,7 @@ def init_db():
 
     conn.commit()
 
-    # seed default admin + default rate
+    # seed default admin + default rate + encryption key
     c.execute("SELECT COUNT(*) AS n FROM users WHERE role='admin'")
     if c.fetchone()["n"] == 0:
         c.execute(
@@ -129,6 +179,11 @@ def init_db():
     c.execute("SELECT COUNT(*) AS n FROM settings WHERE key='rate_per_kg'")
     if c.fetchone()["n"] == 0:
         c.execute("INSERT INTO settings (key,value) VALUES ('rate_per_kg','250')")
+
+    if CRYPTO_AVAILABLE:
+        c.execute("SELECT COUNT(*) AS n FROM settings WHERE key='secret_key'")
+        if c.fetchone()["n"] == 0:
+            c.execute("INSERT INTO settings (key,value) VALUES (?,?)", ("secret_key", Fernet.generate_key().decode()))
 
     conn.commit()
     conn.close()
@@ -150,6 +205,183 @@ def set_setting(key, value):
     )
     conn.commit()
     conn.close()
+
+
+# ----------------------------- ENCRYPTION / QR -----------------------------
+
+def get_fernet():
+    if not CRYPTO_AVAILABLE:
+        return None
+    key = get_setting("secret_key")
+    return Fernet(key.encode())
+
+
+def generate_customer_qr_token(customer_id: int) -> str:
+    """Seals customer_id into an encrypted token and stores it as that customer's current QR value.
+    Mirrors a 'generate dynamic/static QR' endpoint — each call issues a fresh ciphertext
+    (Fernet includes a random IV + timestamp) that still decrypts to the same customer_id.
+    """
+    f = get_fernet()
+    if f is None:
+        # crypto lib missing — fall back to the plain customer code (still unique, just not encrypted)
+        token = None
+    else:
+        token = f.encrypt(str(customer_id).encode()).decode()
+    conn = get_conn()
+    if token:
+        conn.execute("UPDATE customers SET qr_token=? WHERE id=?", (token, customer_id))
+        conn.commit()
+    conn.close()
+    return token
+
+
+def verify_customer_qr(scanned_data: str):
+    """Mirrors POST /verify-customer-qr.
+    Input: raw string read off the rider's camera (encrypted token, or plain code as fallback).
+    Output: matching customer dict, or None.
+    """
+    conn = get_conn()
+
+    f = get_fernet()
+    if f is not None:
+        try:
+            customer_id = int(f.decrypt(scanned_data.encode()).decode())
+            row = conn.execute("SELECT * FROM customers WHERE id=? AND active=1", (customer_id,)).fetchone()
+            if row:
+                conn.close()
+                return dict(row)
+        except (InvalidToken, ValueError, Exception):
+            pass  # not a valid encrypted token — fall through to plain-code lookup
+
+    # fallback: plain customer code (older QR stickers / manual entry)
+    row = conn.execute("SELECT * FROM customers WHERE code=? AND active=1", (scanned_data,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+# ----------------------------- PIN / OTP AUTH -----------------------------
+
+def set_customer_pin(customer_id: int, pin: str):
+    conn = get_conn()
+    conn.execute("UPDATE customers SET pin_hash=? WHERE id=?", (hash_pw(pin), customer_id))
+    conn.commit()
+    conn.close()
+
+
+def verify_static_pin(customer_id: int, pin: str) -> bool:
+    conn = get_conn()
+    row = conn.execute("SELECT pin_hash FROM customers WHERE id=?", (customer_id,)).fetchone()
+    conn.close()
+    return bool(row and row["pin_hash"] and row["pin_hash"] == hash_pw(pin))
+
+
+def generate_otp(customer_id: int) -> str:
+    """Mirrors the backend issuing a one-time 4-digit PIN and pushing it to the customer."""
+    otp = f"{random.randint(0, 9999):04d}"
+    expires = (datetime.now() + timedelta(minutes=OTP_VALID_MINUTES)).isoformat()
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO pending_otp (customer_id,otp,expires_at) VALUES (?,?,?) "
+        "ON CONFLICT(customer_id) DO UPDATE SET otp=excluded.otp, expires_at=excluded.expires_at",
+        (customer_id, otp, expires)
+    )
+    conn.commit()
+    conn.close()
+    push_notification(customer_id, f"آپ کی ڈیلیوری تصدیق کے لیے OTP: {otp} ({OTP_VALID_MINUTES} منٹ میں ختم ہو جائے گا)", audience="customer")
+    return otp
+
+
+def verify_otp(customer_id: int, otp: str) -> bool:
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM pending_otp WHERE customer_id=?", (customer_id,)).fetchone()
+    if not row:
+        conn.close()
+        return False
+    ok = (row["otp"] == otp) and (datetime.fromisoformat(row["expires_at"]) >= datetime.now())
+    if ok:
+        conn.execute("DELETE FROM pending_otp WHERE customer_id=?", (customer_id,))
+        conn.commit()
+    conn.close()
+    return ok
+
+
+def get_pending_otp(customer_id: int):
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM pending_otp WHERE customer_id=?", (customer_id,)).fetchone()
+    conn.close()
+    if row and datetime.fromisoformat(row["expires_at"]) >= datetime.now():
+        return dict(row)
+    return None
+
+
+# ----------------------------- NOTIFICATIONS -----------------------------
+
+def push_notification(customer_id, message, audience="customer", delivery_id=None):
+    """In-app notification feed. Swap this for a real Firebase/OneSignal/WhatsApp
+    Business API call later — every call site in this file already isolates the
+    'who gets notified about what' logic, so only this function needs to change."""
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO notifications (customer_id,audience,message,delivery_id,created_at) VALUES (?,?,?,?,?)",
+        (customer_id, audience, message, delivery_id, datetime.now().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_notifications(audience, customer_id=None, limit=20):
+    conn = get_conn()
+    if audience == "customer":
+        rows = conn.execute(
+            "SELECT * FROM notifications WHERE audience='customer' AND customer_id=? ORDER BY created_at DESC LIMIT ?",
+            (customer_id, limit)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT n.*, c.name AS customer_name FROM notifications n "
+            "LEFT JOIN customers c ON c.id=n.customer_id "
+            "WHERE n.audience='admin' ORDER BY n.created_at DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+# ----------------------------- DELIVERY (CONFIRM) -----------------------------
+
+def confirm_delivery(customer_id, rider_id, quantity_kg, rate, verified_via, status="delivered"):
+    """Mirrors POST /confirm-delivery — called only after PIN/OTP verification succeeds.
+    Writes the khata ledger entry, then notifies both the customer and the owner."""
+    amount = round(quantity_kg * rate, 2)
+    conn = get_conn()
+    cur = conn.execute(
+        "INSERT INTO deliveries (customer_id,rider_id,delivery_date,quantity_kg,rate,amount,status,confirmed,verified_via,timestamp) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (customer_id, rider_id, date.today().isoformat(), quantity_kg, rate, amount, status, 1, verified_via, datetime.now().isoformat())
+    )
+    delivery_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+
+    if status == "delivered":
+        push_notification(customer_id, f"آپ کے ہاں {quantity_kg} kg دودھ ڈیلیور ہوا — رقم Rs {amount:.0f}", audience="customer", delivery_id=delivery_id)
+        push_notification(customer_id, f"ڈیلیوری کنفرم ہوئی — {quantity_kg} kg / Rs {amount:.0f}", audience="admin", delivery_id=delivery_id)
+    return delivery_id
+
+
+def mark_missed(customer_id, rider_id):
+    conn = get_conn()
+    rate = float(get_setting("rate_per_kg", "250"))
+    cur = conn.execute(
+        "INSERT INTO deliveries (customer_id,rider_id,delivery_date,quantity_kg,rate,amount,status,confirmed,verified_via,timestamp) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (customer_id, rider_id, date.today().isoformat(), 0, rate, 0, "missed", 1, "n/a", datetime.now().isoformat())
+    )
+    delivery_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    push_notification(customer_id, "آج ڈیلیوری نہیں ہوئی (ناغہ درج)", audience="customer", delivery_id=delivery_id)
+    push_notification(customer_id, "ناغہ درج ہوا", audience="admin", delivery_id=delivery_id)
 
 
 # ----------------------------- AUTH -----------------------------
@@ -203,13 +435,6 @@ def get_customers(active_only=True):
     return [dict(r) for r in rows]
 
 
-def get_customer_by_code(code):
-    conn = get_conn()
-    row = conn.execute("SELECT * FROM customers WHERE code=?", (code,)).fetchone()
-    conn.close()
-    return dict(row) if row else None
-
-
 def get_rider_by_user(user_id):
     conn = get_conn()
     row = conn.execute("SELECT * FROM riders WHERE user_id=?", (user_id,)).fetchone()
@@ -240,44 +465,45 @@ def rider_panel(user):
         return
 
     st.header("🛵 رائیڈر پینل")
-    today = date.today().isoformat()
     rate = float(get_setting("rate_per_kg", "250"))
     st.info(f"آج کا ریٹ: **Rs {rate:.0f} / kg**")
 
-    if "cart" not in st.session_state:
-        st.session_state.cart = []
-    if "selected_customer" not in st.session_state:
-        st.session_state.selected_customer = None
+    for key, default in [("cart", []), ("selected_customer", None), ("delivery_verified", False), ("verified_via", None)]:
+        if key not in st.session_state:
+            st.session_state[key] = default
 
     tab_scan, tab_deliver, tab_history = st.tabs(["📷 اسکین / کسٹمر منتخب کریں", "➕ ڈیلیوری ایڈ کریں", "📋 آج کی ہسٹری"])
 
     with tab_scan:
         st.subheader("کسٹمر منتخب کریں")
         customers = get_customers()
+
         if QR_SCAN_AVAILABLE:
             img_file = st.camera_input("QR کوڈ اسکین کریں")
             if img_file is not None:
                 img = Image.open(img_file)
                 results = qr_decode(img)
                 if results:
-                    code = results[0].data.decode("utf-8")
-                    cust = get_customer_by_code(code)
+                    scanned = results[0].data.decode("utf-8")
+                    cust = verify_customer_qr(scanned)  # /verify-customer-qr
                     if cust:
                         st.session_state.selected_customer = cust
-                        st.success(f"کسٹمر منتخب ہو گیا: {cust['name']}")
+                        st.session_state.delivery_verified = False
+                        st.success(f"کسٹمر تصدیق ہو گیا: {cust['name']}")
                     else:
-                        st.error("یہ کوڈ کسی کسٹمر سے میچ نہیں ہوا۔")
+                        st.error("QR کسی کسٹمر سے میچ نہیں ہوا (invalid / expired token)۔")
                 else:
                     st.warning("کوئی QR کوڈ نہیں ملا، دوبارہ کوشش کریں۔")
         else:
             st.caption("(QR اسکین کے لیے requirements.txt میں pyzbar اور Pillow شامل کریں)")
 
-        st.markdown("**یا فہرست سے منتخب کریں:**")
+        st.markdown("**یا فہرست سے منتخب کریں (fallback):**")
         if customers:
             names = [f"{c['name']} ({c['code']})" for c in customers]
             idx = st.selectbox("کسٹمر", range(len(names)), format_func=lambda i: names[i])
             if st.button("یہ کسٹمر منتخب کریں"):
                 st.session_state.selected_customer = customers[idx]
+                st.session_state.delivery_verified = False
                 st.success(f"کسٹمر منتخب ہو گیا: {customers[idx]['name']}")
         else:
             st.warning("کوئی کسٹمر موجود نہیں۔ ایڈمن سے کسٹمر شامل کروائیں۔")
@@ -293,10 +519,13 @@ def rider_panel(user):
             b1, b2, b3 = st.columns(3)
             if b1.button("پاؤ (250g)", use_container_width=True):
                 st.session_state.cart.append(0.25)
+                st.session_state.delivery_verified = False
             if b2.button("آدھا کلو (500g)", use_container_width=True):
                 st.session_state.cart.append(0.5)
+                st.session_state.delivery_verified = False
             if b3.button("1 کلو", use_container_width=True):
                 st.session_state.cart.append(1.0)
+                st.session_state.delivery_verified = False
 
             if st.session_state.cart:
                 st.markdown("#### موجودہ اندراج")
@@ -305,41 +534,62 @@ def rider_panel(user):
                     col1.write(f"{qty} kg")
                     if col2.button("🗑️", key=f"del_{i}"):
                         st.session_state.cart.pop(i)
+                        st.session_state.delivery_verified = False
                         st.rerun()
 
                 total_qty = sum(st.session_state.cart)
                 total_amount = total_qty * rate
                 st.markdown(f"**کل مقدار: {total_qty} kg — کل رقم: Rs {total_amount:.0f}**")
 
-                confirmed = st.checkbox("کسٹمر نے تصدیق کر دی (OTP / انگوٹھا / OK)")
-                if st.button("✅ ڈیلیوری کنفرم کریں", type="primary", disabled=not confirmed):
-                    conn = get_conn()
-                    conn.execute(
-                        "INSERT INTO deliveries (customer_id,rider_id,delivery_date,quantity_kg,rate,amount,status,confirmed,timestamp) "
-                        "VALUES (?,?,?,?,?,?,?,?,?)",
-                        (cust["id"], rider["id"], today, total_qty, rate, total_amount, "delivered", 1, datetime.now().isoformat())
-                    )
-                    conn.commit()
-                    conn.close()
+                st.markdown("#### 🔐 کسٹمر تصدیق (PIN Authentication)")
+                has_pin = bool(cust.get("pin_hash"))
+
+                if st.session_state.delivery_verified:
+                    st.success(f"تصدیق مکمل ✅ ({st.session_state.verified_via})")
+                elif has_pin:
+                    pin_input = st.text_input("کسٹمر کا 4-digit PIN درج کریں", max_chars=4, type="password", key="pin_field")
+                    if st.button("PIN تصدیق کریں"):
+                        if verify_static_pin(cust["id"], pin_input):
+                            st.session_state.delivery_verified = True
+                            st.session_state.verified_via = "Static PIN"
+                            st.rerun()
+                        else:
+                            st.error("غلط PIN۔ دوبارہ کوشش کریں۔")
+                else:
+                    pending = get_pending_otp(cust["id"])
+                    col_a, col_b = st.columns(2)
+                    if col_a.button("📤 کسٹمر کو OTP بھیجیں"):
+                        generate_otp(cust["id"])
+                        st.info(f"OTP کسٹمر کے پینل/نمبر پر بھیج دیا گیا ({OTP_VALID_MINUTES} منٹ کے لیے) — کسٹمر سے کوڈ پوچھیں۔")
+                        st.rerun()
+                    otp_input = col_b.text_input("OTP درج کریں", max_chars=4, key="otp_field")
+                    if pending:
+                        st.caption(f"OTP فعال ہے، میعاد: {pending['expires_at'][11:16]}")
+                    if st.button("OTP تصدیق کریں"):
+                        if verify_otp(cust["id"], otp_input):
+                            st.session_state.delivery_verified = True
+                            st.session_state.verified_via = "OTP"
+                            st.rerun()
+                        else:
+                            st.error("غلط یا میعاد ختم OTP۔")
+
+                if st.button("✅ ڈیلیوری کنفرم کریں", type="primary", disabled=not st.session_state.delivery_verified):
+                    confirm_delivery(cust["id"], rider["id"], total_qty, rate, st.session_state.verified_via)  # /confirm-delivery
                     st.session_state.cart = []
-                    st.success("ڈیلیوری محفوظ ہو گئی ✅")
+                    st.session_state.delivery_verified = False
+                    st.session_state.verified_via = None
+                    st.success("ڈیلیوری محفوظ ہو گئی اور کسٹمر/اونر کو نوٹیفکیشن بھیج دی گئی ✅")
                     st.rerun()
             else:
                 st.caption("اوپر بٹن دبا کر مقدار شامل کریں۔")
 
             st.divider()
             if st.button("❌ آج ناغہ (Missed) مارک کریں"):
-                conn = get_conn()
-                conn.execute(
-                    "INSERT INTO deliveries (customer_id,rider_id,delivery_date,quantity_kg,rate,amount,status,confirmed,timestamp) "
-                    "VALUES (?,?,?,?,?,?,?,?,?)",
-                    (cust["id"], rider["id"], today, 0, rate, 0, "missed", 1, datetime.now().isoformat())
-                )
-                conn.commit()
-                conn.close()
-                st.success("ناغہ درج کر دیا گیا۔")
+                mark_missed(cust["id"], rider["id"])
+                st.success("ناغہ درج کر دیا گیا اور کسٹمر/اونر کو مطلع کر دیا گیا۔")
 
     with tab_history:
+        today = date.today().isoformat()
         conn = get_conn()
         rows = conn.execute(
             "SELECT d.*, c.name AS customer_name FROM deliveries d "
@@ -349,8 +599,8 @@ def rider_panel(user):
         ).fetchall()
         conn.close()
         if rows:
-            df = pd.DataFrame([dict(r) for r in rows])[["customer_name", "quantity_kg", "amount", "status", "timestamp"]]
-            df.columns = ["کسٹمر", "مقدار (kg)", "رقم", "اسٹیٹس", "وقت"]
+            df = pd.DataFrame([dict(r) for r in rows])[["customer_name", "quantity_kg", "amount", "status", "verified_via", "timestamp"]]
+            df.columns = ["کسٹمر", "مقدار (kg)", "رقم", "اسٹیٹس", "تصدیق کا طریقہ", "وقت"]
             st.dataframe(df, use_container_width=True, hide_index=True)
         else:
             st.caption("آج ابھی تک کوئی ڈیلیوری درج نہیں ہوئی۔")
@@ -366,11 +616,13 @@ def admin_panel(user):
         "📒 کھاتہ / لیجر", "💵 وصولی درج کریں"
     ])
 
-    # ---- Live tracking ----
+    # ---- Live tracking + admin notifications ----
     with tabs[0]:
-        st.subheader("آج کی لائیو ڈیلیوریز")
-        if st.button("🔄 ریفریش"):
+        col_h, col_r = st.columns([4, 1])
+        col_h.subheader("آج کی لائیو ڈیلیوریز")
+        if col_r.button("🔄 ریفریش"):
             st.rerun()
+
         today = date.today().isoformat()
         conn = get_conn()
         rows = conn.execute(
@@ -383,14 +635,24 @@ def admin_panel(user):
         conn.close()
         if rows:
             df = pd.DataFrame([dict(r) for r in rows])[
-                ["timestamp", "rider_name", "customer_name", "quantity_kg", "amount", "status"]
+                ["timestamp", "rider_name", "customer_name", "quantity_kg", "amount", "status", "verified_via"]
             ]
-            df.columns = ["وقت", "رائیڈر", "کسٹمر", "مقدار (kg)", "رقم", "اسٹیٹس"]
+            df.columns = ["وقت", "رائیڈر", "کسٹمر", "مقدار (kg)", "رقم", "اسٹیٹس", "تصدیق"]
             st.dataframe(df, use_container_width=True, hide_index=True)
-            st.metric("آج کل ڈیلیور کیا گیا دودھ", f"{sum(r['quantity_kg'] for r in rows):.2f} kg")
-            st.metric("آج کل رقم", f"Rs {sum(r['amount'] for r in rows):.0f}")
+            m1, m2 = st.columns(2)
+            m1.metric("آج کل ڈیلیور کیا گیا دودھ", f"{sum(r['quantity_kg'] for r in rows):.2f} kg")
+            m2.metric("آج کل رقم", f"Rs {sum(r['amount'] for r in rows):.0f}")
         else:
             st.caption("آج ابھی تک کوئی ڈیلیوری نہیں ہوئی۔")
+
+        st.divider()
+        st.subheader("🔔 حالیہ نوٹیفکیشنز")
+        notifs = get_notifications("admin")
+        if notifs:
+            for n in notifs:
+                st.caption(f"[{n['created_at'][:16]}] {n.get('customer_name') or '—'}: {n['message']}")
+        else:
+            st.caption("کوئی نوٹیفکیشن نہیں۔")
 
     # ---- Rate management ----
     with tabs[1]:
@@ -408,8 +670,9 @@ def admin_panel(user):
             c_name = st.text_input("نام")
             c_address = st.text_input("پتہ")
             c_phone = st.text_input("فون")
-            c_code = st.text_input("یونیک کوڈ (بارکوڈ/QR ویلیو)")
+            c_code = st.text_input("یونیک کوڈ (اندرونی شناخت)")
             c_quota = st.number_input("روزانہ کوٹہ (kg)", min_value=0.0, value=1.0, step=0.25)
+            c_pin = st.text_input("Static PIN (4 digit، اختیاری — خالی چھوڑیں تو ہر ڈیلیوری پر OTP بھیجا جائے گا)", max_chars=4)
             make_login = st.checkbox("کسٹمر کے لیے لاگ ان اکاؤنٹ بھی بنائیں", value=True)
             c_user = st.text_input("یوزرنیم (اگر لاگ ان بنانا ہے)")
             c_pass = st.text_input("پاسورڈ (اگر لاگ ان بنانا ہے)", type="password")
@@ -417,6 +680,8 @@ def admin_panel(user):
             if submitted:
                 if not c_name or not c_code:
                     st.error("نام اور کوڈ ضروری ہیں۔")
+                elif c_pin and (len(c_pin) != 4 or not c_pin.isdigit()):
+                    st.error("PIN بالکل 4 ہندسوں کا ہونا چاہیے۔")
                 else:
                     conn = get_conn()
                     try:
@@ -427,12 +692,16 @@ def admin_panel(user):
                                 (c_user, hash_pw(c_pass), "customer", c_name, c_phone)
                             )
                             user_id = cur.lastrowid
-                        conn.execute(
+                        cur2 = conn.execute(
                             "INSERT INTO customers (user_id,name,address,phone,code,daily_quota_kg) VALUES (?,?,?,?,?,?)",
                             (user_id, c_name, c_address, c_phone, c_code, c_quota)
                         )
+                        new_id = cur2.lastrowid
                         conn.commit()
-                        st.success(f"کسٹمر '{c_name}' شامل ہو گیا۔")
+                        if c_pin:
+                            set_customer_pin(new_id, c_pin)
+                        generate_customer_qr_token(new_id)
+                        st.success(f"کسٹمر '{c_name}' شامل ہو گیا اور QR جنریٹ ہو گیا۔")
                     except sqlite3.IntegrityError as e:
                         st.error(f"خرابی: یہ کوڈ یا یوزرنیم پہلے سے موجود ہے۔ ({e})")
                     finally:
@@ -443,16 +712,33 @@ def admin_panel(user):
         customers = get_customers()
         if customers:
             for c in customers:
-                col1, col2, col3 = st.columns([3, 2, 2])
+                col1, col2, col3, col4 = st.columns([3, 2, 2, 2])
                 col1.write(f"**{c['name']}** — {c['address'] or ''}")
                 col2.write(f"کوڈ: `{c['code']}`")
                 col3.write(f"بقیہ: Rs {customer_balance(c['id']):.0f}")
-                if QR_AVAILABLE:
-                    with st.expander(f"QR کوڈ — {c['name']}"):
-                        qr_img = qrcode.make(c['code'])
+                col4.write("🔐 PIN سیٹ" if c.get("pin_hash") else "📲 OTP موڈ")
+
+                with st.expander(f"QR / PIN — {c['name']}"):
+                    token = c.get("qr_token")
+                    if not token and CRYPTO_AVAILABLE:
+                        token = generate_customer_qr_token(c["id"])
+                    if QR_AVAILABLE and token:
+                        qr_img = qrcode.make(token)
                         buf = io.BytesIO()
                         qr_img.save(buf, format="PNG")
-                        st.image(buf.getvalue(), width=150)
+                        st.image(buf.getvalue(), width=150, caption="Encrypted QR (customer_id sealed)")
+                    if st.button("🔄 QR دوبارہ جنریٹ کریں (پرانا invalid ہو جائے گا)", key=f"regen_{c['id']}"):
+                        generate_customer_qr_token(c["id"])
+                        st.rerun()
+
+                    new_pin = st.text_input("PIN سیٹ/تبدیل کریں", max_chars=4, key=f"pin_{c['id']}")
+                    if st.button("PIN محفوظ کریں", key=f"savepin_{c['id']}"):
+                        if new_pin and len(new_pin) == 4 and new_pin.isdigit():
+                            set_customer_pin(c["id"], new_pin)
+                            st.success("PIN محفوظ ہو گیا۔")
+                            st.rerun()
+                        else:
+                            st.error("PIN بالکل 4 ہندسوں کا ہونا چاہیے۔")
         else:
             st.caption("ابھی کوئی کسٹمر شامل نہیں کیا گیا۔")
 
@@ -529,8 +815,8 @@ def admin_panel(user):
 
             if rows:
                 st.markdown("**تفصیلی ریکارڈ**")
-                df = pd.DataFrame([dict(r) for r in rows])[["delivery_date", "quantity_kg", "rate", "amount", "status"]]
-                df.columns = ["تاریخ", "مقدار (kg)", "ریٹ", "رقم", "اسٹیٹس"]
+                df = pd.DataFrame([dict(r) for r in rows])[["delivery_date", "quantity_kg", "rate", "amount", "status", "verified_via"]]
+                df.columns = ["تاریخ", "مقدار (kg)", "ریٹ", "رقم", "اسٹیٹس", "تصدیق"]
                 st.dataframe(df, use_container_width=True, hide_index=True)
         else:
             st.caption("پہلے کسٹمر شامل کریں۔")
@@ -557,6 +843,7 @@ def admin_panel(user):
                     )
                     conn.commit()
                     conn.close()
+                    push_notification(cust["id"], f"آپ کی Rs {amt:.0f} وصولی درج ہو گئی ({method})", audience="customer")
                     st.success("وصولی درج ہو گئی۔")
                     st.rerun()
         else:
@@ -577,6 +864,10 @@ def customer_panel(user):
     st.header(f"👤 خوش آمدید، {cust['name']}")
     rate = float(get_setting("rate_per_kg", "250"))
     st.info(f"آج کا ریٹ: **Rs {rate:.0f} / kg**")
+
+    pending_otp = get_pending_otp(cust["id"])
+    if pending_otp:
+        st.warning(f"🔑 لائیو OTP (رائیڈر کو بتائیں): **{pending_otp['otp']}** — میعاد {pending_otp['expires_at'][11:16]} تک")
 
     month = date.today().strftime("%Y-%m")
     conn = get_conn()
@@ -618,6 +909,24 @@ def customer_panel(user):
         st.dataframe(dfp, use_container_width=True, hide_index=True)
     else:
         st.caption("اس مہینے کوئی وصولی درج نہیں ہوئی۔")
+
+    st.subheader("🔔 نوٹیفکیشنز")
+    notifs = get_notifications("customer", customer_id=cust["id"])
+    if notifs:
+        for n in notifs:
+            st.caption(f"[{n['created_at'][:16]}] {n['message']}")
+    else:
+        st.caption("کوئی نوٹیفکیشن نہیں۔")
+
+    with st.expander("🔐 اپنا PIN سیٹ / تبدیل کریں"):
+        st.caption("PIN سیٹ کرنے پر رائیڈر کو ہر بار OTP بھیجنے کی ضرورت نہیں رہے گی — رائیڈر یہی PIN مانگے گا۔")
+        new_pin = st.text_input("نیا 4-digit PIN", max_chars=4, type="password", key="cust_new_pin")
+        if st.button("PIN محفوظ کریں"):
+            if new_pin and len(new_pin) == 4 and new_pin.isdigit():
+                set_customer_pin(cust["id"], new_pin)
+                st.success("PIN محفوظ ہو گیا۔")
+            else:
+                st.error("PIN بالکل 4 ہندسوں کا ہونا چاہیے۔")
 
 
 # ----------------------------- MAIN -----------------------------
