@@ -1234,23 +1234,42 @@ def customer_panel(user):
 # ----------------------------- MAIN -----------------------------
 
 def apply_theme():
+    """Inline CSS fallback — applies even if .streamlit/config.toml isn't picked up
+    (wrong working directory, Streamlit Cloud path issue, or a manually-overridden
+    browser theme). Uses !important so it wins regardless of theme source."""
     st.markdown("""
     <style>
-        .stApp { background-color: #FFFFFF; }
+        html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"] {
+            background-color: #FFFFFF !important;
+            color: #1F2A37 !important;
+        }
+        [data-testid="stHeader"] { background-color: #FFFFFF !important; }
+        [data-testid="stSidebar"] {
+            background-color: #F1F3F5 !important;
+        }
         [data-testid="stMetric"] {
-            background-color: #F1F3F5;
+            background-color: #F1F3F5 !important;
             padding: 12px;
             border-radius: 10px;
             border: 1px solid #E2E5E9;
         }
-        [data-testid="stMetricLabel"] { color: #4B5563; }
-        [data-testid="stMetricValue"] { color: #1F2A37; }
-        h1, h2, h3, h4 { color: #1F2A37; }
-        .stButton > button[kind="primary"] {
-            background-color: #3B6EA5;
-            border-color: #3B6EA5;
+        [data-testid="stMetricLabel"] { color: #4B5563 !important; }
+        [data-testid="stMetricValue"] { color: #1F2A37 !important; }
+        h1, h2, h3, h4, h5, p, span, label, div { color: #1F2A37; }
+        .stButton > button {
+            border-color: #3B6EA5 !important;
+            color: #3B6EA5 !important;
         }
-        [data-testid="stSidebar"] { background-color: #F1F3F5; }
+        .stButton > button[kind="primary"] {
+            background-color: #3B6EA5 !important;
+            border-color: #3B6EA5 !important;
+            color: #FFFFFF !important;
+        }
+        [data-testid="stTabs"] button[aria-selected="true"] {
+            color: #3B6EA5 !important;
+            border-bottom-color: #3B6EA5 !important;
+        }
+        a, a:visited { color: #3B6EA5 !important; }
     </style>
     """, unsafe_allow_html=True)
 
