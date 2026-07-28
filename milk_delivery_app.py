@@ -1269,7 +1269,14 @@ def apply_theme():
             color: #3B6EA5 !important;
             border-bottom-color: #3B6EA5 !important;
         }
+        [data-baseweb="tab-highlight"] {
+            background-color: #3B6EA5 !important;
+        }
+        [data-baseweb="tab-list"] { border-bottom-color: #E2E5E9 !important; }
         a, a:visited { color: #3B6EA5 !important; }
+        :root, .stApp {
+            --primary-color: #3B6EA5;
+        }
     </style>
     """, unsafe_allow_html=True)
 
