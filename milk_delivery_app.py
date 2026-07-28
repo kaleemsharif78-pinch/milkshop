@@ -2,16 +2,13 @@
 Doodh Delivery System — NABA TECH BY KALEEM ULLAH SHARIF
 Roles: Rider, Owner/Admin, Customer
 
-v2: Encrypted QR (customer_id sealed with Fernet), scan verification,
-PIN/OTP authentication before a delivery is confirmed, and an
-in-app notification feed standing in for push notifications.
-
-Note on "API" terms: this is a single-file Streamlit app, so
-/verify-customer-qr and /confirm-delivery are implemented as plain
-Python functions with the same contract described in the spec
-(input -> decrypt/verify -> DB write -> notify). If this later needs
-to serve a separate mobile customer app, these functions can be
-lifted as-is into a FastAPI backend without changing their logic.
+v6:
+- Multi-product support (milk, yogurt, butter, ghee, cream + admin-defined items)
+- Full "[time] - [day] - [date]" stamps everywhere
+- Admin password reset for any rider/customer
+- New color theme (mid blue / ash white / dark text) via .streamlit/config.toml
+- Kept from earlier versions: encrypted QR, 1-tap no-PIN delivery flow,
+  rider cash recovery + settlement, in-app notifications, khata ledger
 """
 
 import streamlit as st
@@ -19,6 +16,8 @@ import sqlite3
 from datetime import datetime, date
 import hashlib
 import io
+import secrets
+import string
 import pandas as pd
 
 try:
@@ -41,6 +40,30 @@ except ImportError:
     CRYPTO_AVAILABLE = False
 
 DB_PATH = "milk_delivery.db"
+
+UNIT_PRESETS = {
+    "kg": [("250g", 0.25), ("500g", 0.5), ("1kg", 1.0)],
+    "liter": [("250ml", 0.25), ("500ml", 0.5), ("1L", 1.0)],
+    "packet": [("1 پیکٹ", 1), ("2 پیکٹ", 2), ("5 پیکٹ", 5)],
+    "piece": [("1", 1), ("2", 2), ("5", 5)],
+    "dozen": [("1", 1), ("2", 2), ("5", 5)],
+}
+
+
+def unit_presets(unit):
+    return UNIT_PRESETS.get(unit, UNIT_PRESETS["piece"])
+
+
+def format_ts(iso_str):
+    """[time] - [day] - [date]  e.g. 07:15 AM - Monday - 28 July 2026"""
+    if not iso_str:
+        return ""
+    try:
+        dt = datetime.fromisoformat(iso_str)
+    except ValueError:
+        return iso_str
+    return dt.strftime("%I:%M %p - %A - %d %B %Y")
+
 
 # ----------------------------- DB LAYER -----------------------------
 
@@ -91,10 +114,7 @@ def init_db():
             FOREIGN KEY(user_id) REFERENCES users(id)
         )
     """)
-    # migrations for existing DBs
     _add_column_if_missing(conn, "customers", "qr_token TEXT")
-    _add_column_if_missing(conn, "customers", "pin_hash TEXT")
-    _add_column_if_missing(conn, "customers", "pin_plain TEXT")
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS riders (
@@ -107,6 +127,7 @@ def init_db():
         )
     """)
 
+    # ---- legacy single-product table (kept read-only, for one-time migration) ----
     c.execute("""
         CREATE TABLE IF NOT EXISTS deliveries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -116,15 +137,53 @@ def init_db():
             quantity_kg REAL NOT NULL,
             rate REAL NOT NULL,
             amount REAL NOT NULL,
-            status TEXT NOT NULL DEFAULT 'delivered' CHECK(status IN ('delivered','missed','extra')),
+            status TEXT NOT NULL DEFAULT 'delivered',
             confirmed INTEGER DEFAULT 0,
+            verified_via TEXT,
+            timestamp TEXT NOT NULL
+        )
+    """)
+
+    # ---- multi-product schema ----
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS products (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            unit TEXT NOT NULL DEFAULT 'kg',
+            rate REAL NOT NULL DEFAULT 0,
+            is_default_quota_item INTEGER DEFAULT 0,
+            active INTEGER DEFAULT 1
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS delivery_txns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER NOT NULL,
+            rider_id INTEGER NOT NULL,
+            delivery_date TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'delivered' CHECK(status IN ('delivered','missed')),
+            total_amount REAL NOT NULL DEFAULT 0,
             verified_via TEXT,
             timestamp TEXT NOT NULL,
             FOREIGN KEY(customer_id) REFERENCES customers(id),
             FOREIGN KEY(rider_id) REFERENCES riders(id)
         )
     """)
-    _add_column_if_missing(conn, "deliveries", "verified_via TEXT")
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS delivery_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            transaction_id INTEGER NOT NULL,
+            product_id INTEGER,
+            product_name TEXT NOT NULL,
+            unit TEXT NOT NULL,
+            quantity REAL NOT NULL,
+            rate REAL NOT NULL,
+            amount REAL NOT NULL,
+            FOREIGN KEY(transaction_id) REFERENCES delivery_txns(id)
+        )
+    """)
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS payments (
@@ -136,26 +195,6 @@ def init_db():
             note TEXT,
             timestamp TEXT NOT NULL,
             FOREIGN KEY(customer_id) REFERENCES customers(id)
-        )
-    """)
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS pending_otp (
-            customer_id INTEGER PRIMARY KEY,
-            otp TEXT NOT NULL,
-            expires_at TEXT NOT NULL
-        )
-    """)
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS notifications (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            customer_id INTEGER,
-            audience TEXT NOT NULL CHECK(audience IN ('customer','admin')),
-            message TEXT NOT NULL,
-            delivery_id INTEGER,
-            created_at TEXT NOT NULL,
-            is_read INTEGER DEFAULT 0
         )
     """)
 
@@ -184,6 +223,18 @@ def init_db():
     """)
 
     c.execute("""
+        CREATE TABLE IF NOT EXISTS notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER,
+            audience TEXT NOT NULL CHECK(audience IN ('customer','admin')),
+            message TEXT NOT NULL,
+            delivery_id INTEGER,
+            created_at TEXT NOT NULL,
+            is_read INTEGER DEFAULT 0
+        )
+    """)
+
+    c.execute("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
@@ -192,7 +243,7 @@ def init_db():
 
     conn.commit()
 
-    # seed default admin + default rate + encryption key
+    # seed default admin
     c.execute("SELECT COUNT(*) AS n FROM users WHERE role='admin'")
     if c.fetchone()["n"] == 0:
         c.execute(
@@ -208,7 +259,46 @@ def init_db():
         if c.fetchone()["n"] == 0:
             c.execute("INSERT INTO settings (key,value) VALUES (?,?)", ("secret_key", Fernet.generate_key().decode()))
 
+    # seed default dairy products (milk rate carried over from the old single-rate setting)
+    c.execute("SELECT COUNT(*) AS n FROM products")
+    if c.fetchone()["n"] == 0:
+        milk_rate = float(c.execute("SELECT value FROM settings WHERE key='rate_per_kg'").fetchone()["value"])
+        default_products = [
+            ("دودھ (Milk)", "kg", milk_rate, 1),
+            ("دہی (Yogurt)", "kg", 300.0, 0),
+            ("مکھن (Butter)", "kg", 1200.0, 0),
+            ("دیسی گھی (Desi Ghee)", "kg", 2500.0, 0),
+            ("ملائی (Fresh Cream)", "kg", 600.0, 0),
+        ]
+        c.executemany(
+            "INSERT INTO products (name,unit,rate,is_default_quota_item) VALUES (?,?,?,?)",
+            default_products
+        )
+
     conn.commit()
+
+    # one-time migration: old single-product `deliveries` rows -> delivery_txns/delivery_items
+    c.execute("SELECT COUNT(*) AS n FROM delivery_txns")
+    already_migrated = c.fetchone()["n"] > 0
+    c.execute("SELECT COUNT(*) AS n FROM deliveries")
+    has_legacy = c.fetchone()["n"] > 0
+    if has_legacy and not already_migrated:
+        milk = c.execute("SELECT id, name, unit FROM products WHERE is_default_quota_item=1").fetchone()
+        for row in c.execute("SELECT * FROM deliveries ORDER BY id").fetchall():
+            cur = c.execute(
+                "INSERT INTO delivery_txns (customer_id,rider_id,delivery_date,status,total_amount,verified_via,timestamp) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (row["customer_id"], row["rider_id"], row["delivery_date"], row["status"], row["amount"], row["verified_via"], row["timestamp"])
+            )
+            txn_id = cur.lastrowid
+            if row["quantity_kg"] and row["quantity_kg"] > 0:
+                c.execute(
+                    "INSERT INTO delivery_items (transaction_id,product_id,product_name,unit,quantity,rate,amount) VALUES (?,?,?,?,?,?,?)",
+                    (txn_id, milk["id"] if milk else None, milk["name"] if milk else "دودھ", milk["unit"] if milk else "kg",
+                     row["quantity_kg"], row["rate"], row["amount"])
+                )
+        conn.commit()
+
     conn.close()
 
 
@@ -230,6 +320,43 @@ def set_setting(key, value):
     conn.close()
 
 
+# ----------------------------- PRODUCTS -----------------------------
+
+def get_products(active_only=True):
+    conn = get_conn()
+    q = "SELECT * FROM products"
+    if active_only:
+        q += " WHERE active=1"
+    q += " ORDER BY is_default_quota_item DESC, name"
+    rows = conn.execute(q).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_default_quota_product():
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM products WHERE is_default_quota_item=1 AND active=1 LIMIT 1").fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def add_product(name, unit, rate):
+    conn = get_conn()
+    conn.execute("INSERT INTO products (name,unit,rate) VALUES (?,?,?)", (name, unit, rate))
+    conn.commit()
+    conn.close()
+
+
+def update_product(product_id, name, unit, rate, active):
+    conn = get_conn()
+    conn.execute(
+        "UPDATE products SET name=?, unit=?, rate=?, active=? WHERE id=?",
+        (name, unit, rate, 1 if active else 0, product_id)
+    )
+    conn.commit()
+    conn.close()
+
+
 # ----------------------------- ENCRYPTION / QR -----------------------------
 
 def get_fernet():
@@ -240,16 +367,8 @@ def get_fernet():
 
 
 def generate_customer_qr_token(customer_id: int) -> str:
-    """Seals customer_id into an encrypted token and stores it as that customer's current QR value.
-    Mirrors a 'generate dynamic/static QR' endpoint — each call issues a fresh ciphertext
-    (Fernet includes a random IV + timestamp) that still decrypts to the same customer_id.
-    """
     f = get_fernet()
-    if f is None:
-        # crypto lib missing — fall back to the plain customer code (still unique, just not encrypted)
-        token = None
-    else:
-        token = f.encrypt(str(customer_id).encode()).decode()
+    token = f.encrypt(str(customer_id).encode()).decode() if f else None
     conn = get_conn()
     if token:
         conn.execute("UPDATE customers SET qr_token=? WHERE id=?", (token, customer_id))
@@ -259,12 +378,8 @@ def generate_customer_qr_token(customer_id: int) -> str:
 
 
 def verify_customer_qr(scanned_data: str):
-    """Mirrors POST /verify-customer-qr.
-    Input: raw string read off the rider's camera (encrypted token, or plain code as fallback).
-    Output: matching customer dict, or None.
-    """
+    """Mirrors POST /verify-customer-qr."""
     conn = get_conn()
-
     f = get_fernet()
     if f is not None:
         try:
@@ -274,9 +389,7 @@ def verify_customer_qr(scanned_data: str):
                 conn.close()
                 return dict(row)
         except (InvalidToken, ValueError, Exception):
-            pass  # not a valid encrypted token — fall through to plain-code lookup
-
-    # fallback: plain customer code (older QR stickers / manual entry)
+            pass
     row = conn.execute("SELECT * FROM customers WHERE code=? AND active=1", (scanned_data,)).fetchone()
     conn.close()
     return dict(row) if row else None
@@ -285,9 +398,6 @@ def verify_customer_qr(scanned_data: str):
 # ----------------------------- NOTIFICATIONS -----------------------------
 
 def push_notification(customer_id, message, audience="customer", delivery_id=None):
-    """In-app notification feed. Swap this for a real Firebase/OneSignal/WhatsApp
-    Business API call later — every call site in this file already isolates the
-    'who gets notified about what' logic, so only this function needs to change."""
     conn = get_conn()
     conn.execute(
         "INSERT INTO notifications (customer_id,audience,message,delivery_id,created_at) VALUES (?,?,?,?,?)",
@@ -318,7 +428,6 @@ def get_notifications(audience, customer_id=None, limit=20):
 # ----------------------------- RIDER CASH RECOVERY -----------------------------
 
 def rider_cash_in_hand(rider_id: int) -> float:
-    """Real-time cash a rider is currently holding: everything collected minus everything settled."""
     conn = get_conn()
     collected = conn.execute(
         "SELECT COALESCE(SUM(amount),0) AS s FROM cash_collections WHERE rider_id=?", (rider_id,)
@@ -331,9 +440,6 @@ def rider_cash_in_hand(rider_id: int) -> float:
 
 
 def record_cash_collection(rider_id: int, customer_id, amount: float, note: str = ""):
-    """Rider collects cash from a customer on the spot. This both reduces the
-    customer's khata balance (payments table) and adds to the rider's cash-in-hand
-    (cash_collections table) until the rider settles up with the owner."""
     conn = get_conn()
     conn.execute(
         "INSERT INTO cash_collections (rider_id,customer_id,amount,note,timestamp) VALUES (?,?,?,?,?)",
@@ -351,8 +457,6 @@ def record_cash_collection(rider_id: int, customer_id, amount: float, note: str 
 
 
 def settle_rider_cash(rider_id: int, amount: float, note: str = ""):
-    """Owner/admin receives cash physically handed over by the rider. Reduces that
-    rider's cash-in-hand by `amount` (pass the full current amount to zero it out)."""
     conn = get_conn()
     conn.execute(
         "INSERT INTO cash_settlements (rider_id,amount,note,timestamp) VALUES (?,?,?,?)",
@@ -364,39 +468,80 @@ def settle_rider_cash(rider_id: int, amount: float, note: str = ""):
 
 # ----------------------------- DELIVERY (CONFIRM) -----------------------------
 
-def confirm_delivery(customer_id, rider_id, quantity_kg, rate, status="delivered"):
-    """Mirrors POST /confirm-delivery. One-tap: scan -> quantity -> confirm, no PIN/OTP wait.
-    Writes the khata ledger entry, then instantly notifies both the customer and the owner."""
-    amount = round(quantity_kg * rate, 2)
+def items_summary_text(cart_items):
+    return ", ".join(f"{it['product_name']} {it['qty']}{it['unit']}" for it in cart_items)
+
+
+def confirm_delivery(customer_id, rider_id, cart_items, status="delivered"):
+    """Mirrors POST /confirm-delivery. One-tap, multi-product: no PIN wait.
+    cart_items: list of {product_id, product_name, unit, qty, rate}
+    """
+    total_amount = round(sum(it["qty"] * it["rate"] for it in cart_items), 2)
     conn = get_conn()
     cur = conn.execute(
-        "INSERT INTO deliveries (customer_id,rider_id,delivery_date,quantity_kg,rate,amount,status,confirmed,verified_via,timestamp) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?)",
-        (customer_id, rider_id, date.today().isoformat(), quantity_kg, rate, amount, status, 1, "QR Scan", datetime.now().isoformat())
+        "INSERT INTO delivery_txns (customer_id,rider_id,delivery_date,status,total_amount,verified_via,timestamp) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (customer_id, rider_id, date.today().isoformat(), status, total_amount, "QR Scan", datetime.now().isoformat())
     )
-    delivery_id = cur.lastrowid
+    txn_id = cur.lastrowid
+    for it in cart_items:
+        amount = round(it["qty"] * it["rate"], 2)
+        conn.execute(
+            "INSERT INTO delivery_items (transaction_id,product_id,product_name,unit,quantity,rate,amount) VALUES (?,?,?,?,?,?,?)",
+            (txn_id, it.get("product_id"), it["product_name"], it["unit"], it["qty"], it["rate"], amount)
+        )
     conn.commit()
     conn.close()
 
-    if status == "delivered":
-        push_notification(customer_id, f"آپ کے ہاں {quantity_kg} kg دودھ ڈیلیور ہوا — رقم Rs {amount:.0f}", audience="customer", delivery_id=delivery_id)
-        push_notification(customer_id, f"ڈیلیوری کنفرم ہوئی — {quantity_kg} kg / Rs {amount:.0f}", audience="admin", delivery_id=delivery_id)
-    return delivery_id
+    if status == "delivered" and cart_items:
+        summary = items_summary_text(cart_items)
+        push_notification(customer_id, f"آپ کے ہاں {summary} ڈیلیور ہوا — رقم Rs {total_amount:.0f}", audience="customer", delivery_id=txn_id)
+        push_notification(customer_id, f"ڈیلیوری کنفرم ہوئی — {summary} / Rs {total_amount:.0f}", audience="admin", delivery_id=txn_id)
+    return txn_id
 
 
 def mark_missed(customer_id, rider_id):
     conn = get_conn()
-    rate = float(get_setting("rate_per_kg", "250"))
     cur = conn.execute(
-        "INSERT INTO deliveries (customer_id,rider_id,delivery_date,quantity_kg,rate,amount,status,confirmed,verified_via,timestamp) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?)",
-        (customer_id, rider_id, date.today().isoformat(), 0, rate, 0, "missed", 1, "n/a", datetime.now().isoformat())
+        "INSERT INTO delivery_txns (customer_id,rider_id,delivery_date,status,total_amount,verified_via,timestamp) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (customer_id, rider_id, date.today().isoformat(), "missed", 0, "n/a", datetime.now().isoformat())
     )
-    delivery_id = cur.lastrowid
+    txn_id = cur.lastrowid
     conn.commit()
     conn.close()
-    push_notification(customer_id, "آج ڈیلیوری نہیں ہوئی (ناغہ درج)", audience="customer", delivery_id=delivery_id)
-    push_notification(customer_id, "ناغہ درج ہوا", audience="admin", delivery_id=delivery_id)
+    push_notification(customer_id, "آج ڈیلیوری نہیں ہوئی (ناغہ درج)", audience="customer", delivery_id=txn_id)
+    push_notification(customer_id, "ناغہ درج ہوا", audience="admin", delivery_id=txn_id)
+
+
+def get_transactions(customer_id=None, rider_id=None, date_filter=None, month_filter=None):
+    q = (
+        "SELECT dt.*, c.name AS customer_name, r.name AS rider_name, "
+        "GROUP_CONCAT(di.product_name || ' ' || di.quantity || di.unit, ', ') AS items_summary "
+        "FROM delivery_txns dt "
+        "JOIN customers c ON c.id=dt.customer_id "
+        "JOIN riders r ON r.id=dt.rider_id "
+        "LEFT JOIN delivery_items di ON di.transaction_id=dt.id "
+        "WHERE 1=1"
+    )
+    params = []
+    if customer_id:
+        q += " AND dt.customer_id=?"
+        params.append(customer_id)
+    if rider_id:
+        q += " AND dt.rider_id=?"
+        params.append(rider_id)
+    if date_filter:
+        q += " AND dt.delivery_date=?"
+        params.append(date_filter)
+    if month_filter:
+        q += " AND dt.delivery_date LIKE ?"
+        params.append(f"{month_filter}%")
+    q += " GROUP BY dt.id ORDER BY dt.timestamp DESC"
+    conn = get_conn()
+    rows = conn.execute(q, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 # ----------------------------- AUTH -----------------------------
@@ -410,6 +555,17 @@ def authenticate(username, password):
     if row and row["password"] == hash_pw(password):
         return dict(row)
     return None
+
+
+def random_password(length=6):
+    return "".join(secrets.choice(string.digits) for _ in range(length))
+
+
+def reset_user_password(user_id, new_password):
+    conn = get_conn()
+    conn.execute("UPDATE users SET password=? WHERE id=?", (hash_pw(new_password), user_id))
+    conn.commit()
+    conn.close()
 
 
 def login_page():
@@ -460,7 +616,7 @@ def get_rider_by_user(user_id):
 def customer_balance(customer_id):
     conn = get_conn()
     total_amount = conn.execute(
-        "SELECT COALESCE(SUM(amount),0) AS s FROM deliveries WHERE customer_id=? AND status!='missed'",
+        "SELECT COALESCE(SUM(total_amount),0) AS s FROM delivery_txns WHERE customer_id=? AND status!='missed'",
         (customer_id,)
     ).fetchone()["s"]
     total_paid = conn.execute(
@@ -480,8 +636,8 @@ def rider_panel(user):
         return
 
     st.header("🛵 رائیڈر پینل")
-    rate = float(get_setting("rate_per_kg", "250"))
-    st.info(f"آج کا ریٹ: **Rs {rate:.0f} / kg**")
+    products = get_products()
+    milk = get_default_quota_product()
 
     for key, default in [("cart", []), ("selected_customer", None)]:
         if key not in st.session_state:
@@ -504,11 +660,16 @@ def rider_panel(user):
                 results = qr_decode(img)
                 if results:
                     scanned = results[0].data.decode("utf-8")
-                    cust = verify_customer_qr(scanned)  # /verify-customer-qr
+                    cust = verify_customer_qr(scanned)
                     if cust:
                         if not st.session_state.selected_customer or st.session_state.selected_customer["id"] != cust["id"]:
                             st.session_state.selected_customer = cust
-                            st.session_state.cart = [cust["daily_quota_kg"]] if cust["daily_quota_kg"] > 0 else []
+                            st.session_state.cart = []
+                            if milk and cust["daily_quota_kg"] > 0:
+                                st.session_state.cart.append({
+                                    "product_id": milk["id"], "product_name": milk["name"],
+                                    "unit": milk["unit"], "qty": cust["daily_quota_kg"], "rate": milk["rate"]
+                                })
                         st.success(f"کسٹمر لوڈ ہو گیا: {cust['name']}")
                     else:
                         st.error("QR کسی کسٹمر سے میچ نہیں ہوا (invalid token)۔")
@@ -524,7 +685,12 @@ def rider_panel(user):
             if st.button("یہ کسٹمر لوڈ کریں"):
                 cust = customers[idx]
                 st.session_state.selected_customer = cust
-                st.session_state.cart = [cust["daily_quota_kg"]] if cust["daily_quota_kg"] > 0 else []
+                st.session_state.cart = []
+                if milk and cust["daily_quota_kg"] > 0:
+                    st.session_state.cart.append({
+                        "product_id": milk["id"], "product_name": milk["name"],
+                        "unit": milk["unit"], "qty": cust["daily_quota_kg"], "rate": milk["rate"]
+                    })
                 st.rerun()
         else:
             st.warning("کوئی کسٹمر موجود نہیں۔ ایڈمن سے کسٹمر شامل کروائیں۔")
@@ -536,40 +702,43 @@ def rider_panel(user):
             c1, c2, c3 = st.columns(3)
             c1.metric("نام", cust["name"])
             c2.metric("ایڈریس", cust["address"] or "—")
-            c3.metric("ڈیفالٹ کوانٹٹی", f"{cust['daily_quota_kg']} kg")
+            c3.metric("ڈیفالٹ دودھ", f"{cust['daily_quota_kg']} kg")
             st.caption(f"بقیہ: Rs {customer_balance(cust['id']):.0f}")
 
-            st.subheader("3️⃣ مقدار (ضرورت پر اضافہ کریں)")
-            b1, b2, b3 = st.columns(3)
-            if b1.button("➕ پاؤ (250g)", use_container_width=True):
-                st.session_state.cart.append(0.25)
-            if b2.button("➕ آدھا کلو (500g)", use_container_width=True):
-                st.session_state.cart.append(0.5)
-            if b3.button("➕ 1 کلو", use_container_width=True):
-                st.session_state.cart.append(1.0)
+            st.subheader("3️⃣ پروڈکٹس شامل کریں")
+            for p in products:
+                st.markdown(f"**{p['name']}** — Rs {p['rate']:.0f}/{p['unit']}")
+                pcols = st.columns(len(unit_presets(p["unit"])))
+                for col, (label, qty) in zip(pcols, unit_presets(p["unit"])):
+                    if col.button(f"➕ {label}", key=f"qa_{p['id']}_{label}", use_container_width=True):
+                        st.session_state.cart.append({
+                            "product_id": p["id"], "product_name": p["name"],
+                            "unit": p["unit"], "qty": qty, "rate": p["rate"]
+                        })
+                        st.rerun()
 
             if st.session_state.cart:
+                st.divider()
                 st.markdown("#### موجودہ اندراج")
-                for i, qty in enumerate(st.session_state.cart):
+                for i, it in enumerate(st.session_state.cart):
                     col1, col2 = st.columns([4, 1])
-                    col1.write(f"{qty} kg")
+                    col1.write(f"{it['product_name']} — {it['qty']}{it['unit']} (Rs {it['qty']*it['rate']:.0f})")
                     if col2.button("🗑️", key=f"del_{i}"):
                         st.session_state.cart.pop(i)
                         st.rerun()
 
-                total_qty = sum(st.session_state.cart)
-                total_amount = total_qty * rate
-                st.markdown(f"**کل مقدار: {total_qty} kg — کل رقم: Rs {total_amount:.0f}**")
+                total_amount = sum(it["qty"] * it["rate"] for it in st.session_state.cart)
+                st.markdown(f"**کل رقم: Rs {total_amount:.0f}**")
 
                 st.subheader("4️⃣ کنفرم کریں")
                 if st.button("✅ Confirm Delivery", type="primary", use_container_width=True):
-                    confirm_delivery(cust["id"], rider["id"], total_qty, rate)  # /confirm-delivery — instant, no PIN wait
+                    confirm_delivery(cust["id"], rider["id"], st.session_state.cart)
                     st.session_state.cart = []
                     st.session_state.selected_customer = None
                     st.success("✅ ڈیلیوری فوری سیو اور سنک ہو گئی — اونر ڈیش بورڈ اور کسٹمر پینل اپڈیٹ ہو گئے۔")
                     st.rerun()
             else:
-                st.caption("کوئی مقدار موجود نہیں — بٹن دبا کر شامل کریں۔")
+                st.caption("کوئی پروڈکٹ شامل نہیں — اوپر بٹن دبا کر شامل کریں۔")
 
             st.divider()
             if st.button("❌ آج ناغہ (Missed) مارک کریں"):
@@ -612,7 +781,10 @@ def rider_panel(user):
         ).fetchall()
         conn.close()
         if crows:
-            dfc = pd.DataFrame([dict(r) for r in crows])[["timestamp", "customer_name", "amount", "note"]]
+            crows = [dict(r) for r in crows]
+            for r in crows:
+                r["timestamp"] = format_ts(r["timestamp"])
+            dfc = pd.DataFrame(crows)[["timestamp", "customer_name", "amount", "note"]]
             dfc.columns = ["وقت", "کسٹمر", "رقم", "نوٹ"]
             st.dataframe(dfc, use_container_width=True, hide_index=True)
         else:
@@ -620,17 +792,12 @@ def rider_panel(user):
 
     with tab_history:
         today = date.today().isoformat()
-        conn = get_conn()
-        rows = conn.execute(
-            "SELECT d.*, c.name AS customer_name FROM deliveries d "
-            "JOIN customers c ON c.id=d.customer_id "
-            "WHERE d.rider_id=? AND d.delivery_date=? ORDER BY d.timestamp DESC",
-            (rider["id"], today)
-        ).fetchall()
-        conn.close()
+        rows = get_transactions(rider_id=rider["id"], date_filter=today)
         if rows:
-            df = pd.DataFrame([dict(r) for r in rows])[["customer_name", "quantity_kg", "amount", "status", "timestamp"]]
-            df.columns = ["کسٹمر", "مقدار (kg)", "رقم", "اسٹیٹس", "وقت"]
+            for r in rows:
+                r["timestamp"] = format_ts(r["timestamp"])
+            df = pd.DataFrame(rows)[["customer_name", "items_summary", "total_amount", "status", "timestamp"]]
+            df.columns = ["کسٹمر", "پروڈکٹس", "رقم", "اسٹیٹس", "وقت"]
             st.dataframe(df, use_container_width=True, hide_index=True)
         else:
             st.caption("آج ابھی تک کوئی ڈیلیوری درج نہیں ہوئی۔")
@@ -642,8 +809,8 @@ def admin_panel(user):
     st.header("🧑‍💼 اونر / ایڈمن ڈیش بورڈ")
 
     tabs = st.tabs([
-        "📡 لائیو ٹریکنگ", "💰 ریٹ مینجمنٹ", "👥 کسٹمرز", "🛵 رائیڈرز",
-        "📒 کھاتہ / لیجر", "💵 وصولی درج کریں", "🧾 کیش سیٹلمنٹ"
+        "📡 لائیو ٹریکنگ", "🧀 پروڈکٹس / ریٹس", "👥 کسٹمرز", "🛵 رائیڈرز",
+        "📒 کھاتہ / لیجر", "💵 وصولی درج کریں", "🧾 کیش سیٹلمنٹ", "🔑 پاسورڈز"
     ])
 
     # ---- Live tracking + admin notifications ----
@@ -654,24 +821,20 @@ def admin_panel(user):
             st.rerun()
 
         today = date.today().isoformat()
-        conn = get_conn()
-        rows = conn.execute(
-            "SELECT d.*, c.name AS customer_name, r.name AS rider_name FROM deliveries d "
-            "JOIN customers c ON c.id=d.customer_id "
-            "JOIN riders r ON r.id=d.rider_id "
-            "WHERE d.delivery_date=? ORDER BY d.timestamp DESC",
-            (today,)
-        ).fetchall()
-        conn.close()
+        rows = get_transactions(date_filter=today)
         if rows:
-            df = pd.DataFrame([dict(r) for r in rows])[
-                ["timestamp", "rider_name", "customer_name", "quantity_kg", "amount", "status", "verified_via"]
-            ]
-            df.columns = ["وقت", "رائیڈر", "کسٹمر", "مقدار (kg)", "رقم", "اسٹیٹس", "تصدیق"]
-            st.dataframe(df, use_container_width=True, hide_index=True)
-            m1, m2 = st.columns(2)
-            m1.metric("آج کل ڈیلیور کیا گیا دودھ", f"{sum(r['quantity_kg'] for r in rows):.2f} kg")
-            m2.metric("آج کل رقم", f"Rs {sum(r['amount'] for r in rows):.0f}")
+            display_rows = []
+            for r in rows:
+                display_rows.append({
+                    "وقت": format_ts(r["timestamp"]),
+                    "رائیڈر": r["rider_name"],
+                    "کسٹمر": r["customer_name"],
+                    "پروڈکٹس": r["items_summary"] or "—",
+                    "رقم": r["total_amount"],
+                    "اسٹیٹس": r["status"],
+                })
+            st.dataframe(pd.DataFrame(display_rows), use_container_width=True, hide_index=True)
+            st.metric("آج کل رقم", f"Rs {sum(r['total_amount'] for r in rows):.0f}")
         else:
             st.caption("آج ابھی تک کوئی ڈیلیوری نہیں ہوئی۔")
 
@@ -680,18 +843,45 @@ def admin_panel(user):
         notifs = get_notifications("admin")
         if notifs:
             for n in notifs:
-                st.caption(f"[{n['created_at'][:16]}] {n.get('customer_name') or '—'}: {n['message']}")
+                st.caption(f"[{format_ts(n['created_at'])}] {n.get('customer_name') or '—'}: {n['message']}")
         else:
             st.caption("کوئی نوٹیفکیشن نہیں۔")
 
-    # ---- Rate management ----
+    # ---- Products / Rates ----
     with tabs[1]:
-        st.subheader("موجودہ ریٹ")
-        current_rate = float(get_setting("rate_per_kg", "250"))
-        new_rate = st.number_input("ریٹ فی کلو (Rs)", min_value=0.0, value=current_rate, step=5.0)
-        if st.button("ریٹ اپڈیٹ کریں"):
-            set_setting("rate_per_kg", new_rate)
-            st.success(f"ریٹ Rs {new_rate:.0f} فی کلو کر دیا گیا۔ یہ فوراً رائیڈر اور کسٹمر پینل پر بھی اپڈیٹ ہو جائے گا۔")
+        st.subheader("نیا پروڈکٹ شامل کریں")
+        with st.form("add_product"):
+            p_name = st.text_input("پروڈکٹ کا نام (مثلاً پینیر، کھویا)")
+            p_unit = st.selectbox("یونٹ", ["kg", "liter", "packet", "piece", "dozen"])
+            p_rate = st.number_input("ریٹ (Rs فی یونٹ)", min_value=0.0, value=100.0, step=10.0)
+            submitted = st.form_submit_button("شامل کریں")
+            if submitted:
+                if not p_name:
+                    st.error("پروڈکٹ کا نام درج کریں۔")
+                else:
+                    try:
+                        add_product(p_name, p_unit, p_rate)
+                        st.success(f"پروڈکٹ '{p_name}' شامل ہو گیا۔")
+                        st.rerun()
+                    except sqlite3.IntegrityError:
+                        st.error("یہ پروڈکٹ پہلے سے موجود ہے۔")
+
+        st.divider()
+        st.subheader("موجودہ پروڈکٹس")
+        all_products = get_products(active_only=False)
+        for p in all_products:
+            with st.expander(f"{'⭐ ' if p['is_default_quota_item'] else ''}{p['name']} — Rs {p['rate']:.0f}/{p['unit']}"):
+                with st.form(f"edit_product_{p['id']}"):
+                    e_name = st.text_input("نام", value=p["name"], key=f"pname_{p['id']}")
+                    e_unit = st.selectbox("یونٹ", ["kg", "liter", "packet", "piece", "dozen"],
+                                           index=["kg", "liter", "packet", "piece", "dozen"].index(p["unit"]) if p["unit"] in ["kg", "liter", "packet", "piece", "dozen"] else 0,
+                                           key=f"punit_{p['id']}")
+                    e_rate = st.number_input("ریٹ", min_value=0.0, value=float(p["rate"]), step=10.0, key=f"prate_{p['id']}")
+                    e_active = st.checkbox("فعال (Active)", value=bool(p["active"]), key=f"pactive_{p['id']}")
+                    if st.form_submit_button("محفوظ کریں"):
+                        update_product(p["id"], e_name, e_unit, e_rate, e_active)
+                        st.success("اپڈیٹ ہو گیا — رائیڈر اور کسٹمر پینل پر فوراً اثر ہوگا۔")
+                        st.rerun()
 
     # ---- Customers ----
     with tabs[2]:
@@ -701,7 +891,7 @@ def admin_panel(user):
             c_address = st.text_input("پتہ")
             c_phone = st.text_input("فون")
             c_code = st.text_input("یونیک کوڈ (اندرونی شناخت)")
-            c_quota = st.number_input("روزانہ کوٹہ (kg)", min_value=0.0, value=1.0, step=0.25)
+            c_quota = st.number_input("روزانہ ڈیفالٹ دودھ (kg)", min_value=0.0, value=1.0, step=0.25)
             make_login = st.checkbox("کسٹمر کے لیے لاگ ان اکاؤنٹ بھی بنائیں", value=True)
             c_user = st.text_input("یوزرنیم (اگر لاگ ان بنانا ہے)")
             c_pass = st.text_input("پاسورڈ (اگر لاگ ان بنانا ہے)", type="password")
@@ -804,11 +994,8 @@ def admin_panel(user):
             cust = customers[sel]
 
             month = st.text_input("مہینہ (YYYY-MM)", value=date.today().strftime("%Y-%m"))
+            rows = get_transactions(customer_id=cust["id"], month_filter=month)
             conn = get_conn()
-            rows = conn.execute(
-                "SELECT * FROM deliveries WHERE customer_id=? AND delivery_date LIKE ? ORDER BY delivery_date",
-                (cust["id"], f"{month}%")
-            ).fetchall()
             pay_rows = conn.execute(
                 "SELECT * FROM payments WHERE customer_id=? AND payment_date LIKE ? ORDER BY payment_date",
                 (cust["id"], f"{month}%")
@@ -817,22 +1004,24 @@ def admin_panel(user):
 
             delivered = [r for r in rows if r["status"] != "missed"]
             missed = [r for r in rows if r["status"] == "missed"]
-            total_qty = sum(r["quantity_kg"] for r in delivered)
-            total_bill = sum(r["amount"] for r in delivered)
+            total_bill = sum(r["total_amount"] for r in delivered)
             total_paid = sum(r["amount"] for r in pay_rows)
 
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("کل دودھ", f"{total_qty:.2f} kg")
-            m2.metric("کل بل", f"Rs {total_bill:.0f}")
-            m3.metric("وصول شدہ", f"Rs {total_paid:.0f}")
-            m4.metric("باقی بقیہ", f"Rs {customer_balance(cust['id']):.0f}")
+            m1, m2, m3 = st.columns(3)
+            m1.metric("کل بل", f"Rs {total_bill:.0f}")
+            m2.metric("وصول شدہ", f"Rs {total_paid:.0f}")
+            m3.metric("باقی بقیہ", f"Rs {customer_balance(cust['id']):.0f}")
             st.caption(f"ناغے: {len(missed)} دن")
 
             if rows:
                 st.markdown("**تفصیلی ریکارڈ**")
-                df = pd.DataFrame([dict(r) for r in rows])[["delivery_date", "quantity_kg", "rate", "amount", "status", "verified_via"]]
-                df.columns = ["تاریخ", "مقدار (kg)", "ریٹ", "رقم", "اسٹیٹس", "تصدیق"]
-                st.dataframe(df, use_container_width=True, hide_index=True)
+                display_rows = [{
+                    "تاریخ/وقت": format_ts(r["timestamp"]),
+                    "پروڈکٹس": r["items_summary"] or "—",
+                    "رقم": r["total_amount"],
+                    "اسٹیٹس": r["status"],
+                } for r in rows]
+                st.dataframe(pd.DataFrame(display_rows), use_container_width=True, hide_index=True)
         else:
             st.caption("پہلے کسٹمر شامل کریں۔")
 
@@ -906,13 +1095,52 @@ def admin_panel(user):
             ).fetchall()
             conn.close()
             if hist:
-                dfh = pd.DataFrame([dict(r) for r in hist])[["timestamp", "rider_name", "amount", "note"]]
+                hist = [dict(r) for r in hist]
+                for h in hist:
+                    h["timestamp"] = format_ts(h["timestamp"])
+                dfh = pd.DataFrame(hist)[["timestamp", "rider_name", "amount", "note"]]
                 dfh.columns = ["وقت", "رائیڈر", "رقم", "نوٹ"]
                 st.dataframe(dfh, use_container_width=True, hide_index=True)
             else:
                 st.caption("ابھی تک کوئی سیٹلمنٹ نہیں ہوئی۔")
         else:
             st.caption("پہلے رائیڈر شامل کریں۔")
+
+    # ---- Password reset ----
+    with tabs[7]:
+        st.subheader("🔑 کسی بھی یوزر کا پاسورڈ ری سیٹ کریں")
+        conn = get_conn()
+        login_users = conn.execute(
+            "SELECT * FROM users WHERE role IN ('rider','customer') AND active=1 ORDER BY role, name"
+        ).fetchall()
+        conn.close()
+        login_users = [dict(u) for u in login_users]
+
+        if login_users:
+            labels = [f"{u['name']} — {u['role'].upper()} (@{u['username']})" for u in login_users]
+            sel = st.selectbox("یوزر منتخب کریں", range(len(labels)), format_func=lambda i: labels[i])
+            target = login_users[sel]
+
+            mode = st.radio("نیا پاسورڈ", ["خود لکھیں", "رینڈم جنریٹ کریں"], horizontal=True)
+            if mode == "خود لکھیں":
+                new_pw = st.text_input("نیا پاسورڈ", value="123456")
+            else:
+                new_pw = None
+                if st.button("🎲 رینڈم پاسورڈ بنائیں"):
+                    st.session_state["_gen_pw"] = random_password()
+                new_pw = st.session_state.get("_gen_pw")
+                if new_pw:
+                    st.info(f"جنریٹ شدہ پاسورڈ: **{new_pw}**")
+
+            if st.button("✅ پاسورڈ ری سیٹ کریں", type="primary"):
+                if not new_pw:
+                    st.error("پہلے نیا پاسورڈ لکھیں یا جنریٹ کریں۔")
+                else:
+                    reset_user_password(target["id"], new_pw)
+                    st.success(f"{target['name']} (@{target['username']}) کا پاسورڈ ری سیٹ ہو گیا۔ نیا پاسورڈ یوزر کو بتا دیں: **{new_pw}**")
+                    st.session_state.pop("_gen_pw", None)
+        else:
+            st.caption("ابھی کوئی رائیڈر/کسٹمر لاگ ان اکاؤنٹ موجود نہیں۔")
 
 
 # ----------------------------- CUSTOMER PANEL -----------------------------
@@ -930,8 +1158,12 @@ def customer_panel(user):
 
     col_rate, col_qr = st.columns([2, 1])
     with col_rate:
-        rate = float(get_setting("rate_per_kg", "250"))
-        st.info(f"آج کا ریٹ: **Rs {rate:.0f} / kg**")
+        milk = get_default_quota_product()
+        if milk:
+            st.info(f"آج کا دودھ ریٹ: **Rs {milk['rate']:.0f} / {milk['unit']}**")
+        products = get_products()
+        if products:
+            st.caption(" | ".join(f"{p['name']}: Rs {p['rate']:.0f}/{p['unit']}" for p in products if not p["is_default_quota_item"]))
 
     with col_qr:
         st.markdown("**📱 آپ کا QR کوڈ**")
@@ -948,11 +1180,8 @@ def customer_panel(user):
             st.caption(f"آپ کا شناختی کوڈ: `{cust['code']}`")
 
     month = date.today().strftime("%Y-%m")
+    rows = get_transactions(customer_id=cust["id"], month_filter=month)
     conn = get_conn()
-    rows = conn.execute(
-        "SELECT * FROM deliveries WHERE customer_id=? AND delivery_date LIKE ? ORDER BY delivery_date DESC",
-        (cust["id"], f"{month}%")
-    ).fetchall()
     pay_rows = conn.execute(
         "SELECT * FROM payments WHERE customer_id=? AND payment_date LIKE ? ORDER BY payment_date DESC",
         (cust["id"], f"{month}%")
@@ -961,29 +1190,34 @@ def customer_panel(user):
 
     delivered = [r for r in rows if r["status"] != "missed"]
     missed = [r for r in rows if r["status"] == "missed"]
-    total_qty = sum(r["quantity_kg"] for r in delivered)
-    total_bill = sum(r["amount"] for r in delivered)
+    total_bill = sum(r["total_amount"] for r in delivered)
     total_paid = sum(r["amount"] for r in pay_rows)
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("اس مہینے دودھ", f"{total_qty:.2f} kg")
-    m2.metric("کل بل", f"Rs {total_bill:.0f}")
-    m3.metric("جمع کروائی رقم", f"Rs {total_paid:.0f}")
-    m4.metric("باقی بقیہ", f"Rs {customer_balance(cust['id']):.0f}")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("اس مہینے کل بل", f"Rs {total_bill:.0f}")
+    m2.metric("جمع کروائی رقم", f"Rs {total_paid:.0f}")
+    m3.metric("باقی بقیہ", f"Rs {customer_balance(cust['id']):.0f}")
     st.caption(f"اس مہینے ناغے: {len(missed)} دن")
 
     st.subheader("ڈیلیوری تفصیل (اس مہینے)")
     if rows:
-        df = pd.DataFrame([dict(r) for r in rows])[["delivery_date", "quantity_kg", "rate", "amount", "status", "timestamp"]]
-        df.columns = ["تاریخ", "مقدار (kg)", "ریٹ", "رقم", "اسٹیٹس", "وقت"]
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        display_rows = [{
+            "تاریخ/وقت": format_ts(r["timestamp"]),
+            "پروڈکٹس": r["items_summary"] or "—",
+            "رقم": r["total_amount"],
+            "اسٹیٹس": r["status"],
+        } for r in rows]
+        st.dataframe(pd.DataFrame(display_rows), use_container_width=True, hide_index=True)
     else:
         st.caption("اس مہینے ابھی تک کوئی ریکارڈ نہیں۔")
 
     st.subheader("وصولی کی تفصیل")
     if pay_rows:
-        dfp = pd.DataFrame([dict(r) for r in pay_rows])[["payment_date", "amount", "method", "note"]]
-        dfp.columns = ["تاریخ", "رقم", "طریقہ", "نوٹ"]
+        pay_rows = [dict(r) for r in pay_rows]
+        for r in pay_rows:
+            r["timestamp"] = format_ts(r["timestamp"])
+        dfp = pd.DataFrame(pay_rows)[["timestamp", "amount", "method", "note"]]
+        dfp.columns = ["وقت", "رقم", "طریقہ", "نوٹ"]
         st.dataframe(dfp, use_container_width=True, hide_index=True)
     else:
         st.caption("اس مہینے کوئی وصولی درج نہیں ہوئی۔")
@@ -992,15 +1226,38 @@ def customer_panel(user):
     notifs = get_notifications("customer", customer_id=cust["id"])
     if notifs:
         for n in notifs:
-            st.caption(f"[{n['created_at'][:16]}] {n['message']}")
+            st.caption(f"[{format_ts(n['created_at'])}] {n['message']}")
     else:
         st.caption("کوئی نوٹیفکیشن نہیں۔")
 
 
 # ----------------------------- MAIN -----------------------------
 
+def apply_theme():
+    st.markdown("""
+    <style>
+        .stApp { background-color: #FFFFFF; }
+        [data-testid="stMetric"] {
+            background-color: #F1F3F5;
+            padding: 12px;
+            border-radius: 10px;
+            border: 1px solid #E2E5E9;
+        }
+        [data-testid="stMetricLabel"] { color: #4B5563; }
+        [data-testid="stMetricValue"] { color: #1F2A37; }
+        h1, h2, h3, h4 { color: #1F2A37; }
+        .stButton > button[kind="primary"] {
+            background-color: #3B6EA5;
+            border-color: #3B6EA5;
+        }
+        [data-testid="stSidebar"] { background-color: #F1F3F5; }
+    </style>
+    """, unsafe_allow_html=True)
+
+
 def main():
     st.set_page_config(page_title="Doodh Delivery System", page_icon="🥛", layout="wide")
+    apply_theme()
     init_db()
 
     if "user" not in st.session_state:
