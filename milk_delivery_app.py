@@ -1,19 +1,35 @@
 """
 Doodh Delivery System — NABA TECH BY KALEEM ULLAH SHARIF
-Roles: Rider, Owner/Admin, Customer
+Roles: Master Admin, Shop Owner/Admin, Rider, Customer
 
-v6:
-- Multi-product support (milk, yogurt, butter, ghee, cream + admin-defined items)
-- Full "[time] - [day] - [date]" stamps everywhere
-- Admin password reset for any rider/customer
-- New color theme (mid blue / ash white / dark text) via .streamlit/config.toml
-- Kept from earlier versions: encrypted QR, 1-tap no-PIN delivery flow,
-  rider cash recovery + settlement, in-app notifications, khata ledger
+v7 — Multi-tenant SaaS foundation:
+- Master Admin panel: create shops, manage 15-day trial, generate/track
+  license/renewal keys, monitor all shops' orders/riders/products in one place
+- Licensing: 15-day free trial auto-expires and locks the shop's app; Master
+  Admin issues an activation key which the shop admin enters to reactivate
+  for another year
+- Per-shop dynamic theme (primary color, logo emoji/text) driven from the
+  shops table, not hardcoded
+- Every shop-scoped table now carries shop_id for tenant isolation
+- Existing single-tenant deployments are auto-migrated into a "Default Shop"
+  on first run after upgrade, so no data is lost
+
+Kept from earlier versions: encrypted QR, 1-tap no-PIN delivery flow,
+multi-product support, rider cash recovery + settlement, in-app
+notifications, khata ledger, admin password reset, full timestamp format,
+modern self-contained CSS theme.
+
+NOTE — scope for this round: the multi-tenant foundation (this file) is the
+prerequisite for two features still to come in a follow-up round:
+  1) a customer-facing "extra items" catalog/ordering flow with a live running
+     total that notifies rider + admin
+  2) PDF invoice / extra-order receipt / delivery summary generation
+Both will be built on top of this foundation next.
 """
 
 import streamlit as st
 import sqlite3
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import hashlib
 import io
 import secrets
@@ -48,6 +64,14 @@ UNIT_PRESETS = {
     "piece": [("1", 1), ("2", 2), ("5", 5)],
     "dozen": [("1", 1), ("2", 2), ("5", 5)],
 }
+
+DEFAULT_PRODUCTS = [
+    ("دودھ (Milk)", "kg", 250.0, 1),
+    ("دہی (Yogurt)", "kg", 300.0, 0),
+    ("مکھن (Butter)", "kg", 1200.0, 0),
+    ("دیسی گھی (Desi Ghee)", "kg", 2500.0, 0),
+    ("ملائی (Fresh Cream)", "kg", 600.0, 0),
+]
 
 
 def unit_presets(unit):
@@ -89,17 +113,46 @@ def init_db():
     conn = get_conn()
     c = conn.cursor()
 
+    # ---- shops (tenants) ----
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS shops (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'trial' CHECK(status IN ('trial','active','expired','suspended')),
+            trial_end_date TEXT,
+            license_expires_at TEXT,
+            primary_color TEXT DEFAULT '#3B6EA5',
+            logo_emoji TEXT DEFAULT '🥛',
+            logo_text TEXT DEFAULT 'Doodh Delivery System',
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS license_keys (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            shop_id INTEGER NOT NULL,
+            key_code TEXT UNIQUE NOT NULL,
+            duration_days INTEGER NOT NULL DEFAULT 365,
+            is_used INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            used_at TEXT,
+            FOREIGN KEY(shop_id) REFERENCES shops(id)
+        )
+    """)
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
             password TEXT NOT NULL,
-            role TEXT NOT NULL CHECK(role IN ('admin','rider','customer')),
+            role TEXT NOT NULL CHECK(role IN ('master_admin','admin','rider','customer')),
             name TEXT NOT NULL,
             phone TEXT,
             active INTEGER DEFAULT 1
         )
     """)
+    _add_column_if_missing(conn, "users", "shop_id INTEGER")
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS customers (
@@ -115,6 +168,7 @@ def init_db():
         )
     """)
     _add_column_if_missing(conn, "customers", "qr_token TEXT")
+    _add_column_if_missing(conn, "customers", "shop_id INTEGER")
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS riders (
@@ -126,35 +180,19 @@ def init_db():
             FOREIGN KEY(user_id) REFERENCES users(id)
         )
     """)
+    _add_column_if_missing(conn, "riders", "shop_id INTEGER")
 
-    # ---- legacy single-product table (kept read-only, for one-time migration) ----
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS deliveries (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            customer_id INTEGER NOT NULL,
-            rider_id INTEGER NOT NULL,
-            delivery_date TEXT NOT NULL,
-            quantity_kg REAL NOT NULL,
-            rate REAL NOT NULL,
-            amount REAL NOT NULL,
-            status TEXT NOT NULL DEFAULT 'delivered',
-            confirmed INTEGER DEFAULT 0,
-            verified_via TEXT,
-            timestamp TEXT NOT NULL
-        )
-    """)
-
-    # ---- multi-product schema ----
     c.execute("""
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL,
+            name TEXT NOT NULL,
             unit TEXT NOT NULL DEFAULT 'kg',
             rate REAL NOT NULL DEFAULT 0,
             is_default_quota_item INTEGER DEFAULT 0,
             active INTEGER DEFAULT 1
         )
     """)
+    _add_column_if_missing(conn, "products", "shop_id INTEGER")
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS delivery_txns (
@@ -170,6 +208,7 @@ def init_db():
             FOREIGN KEY(rider_id) REFERENCES riders(id)
         )
     """)
+    _add_column_if_missing(conn, "delivery_txns", "shop_id INTEGER")
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS delivery_items (
@@ -233,6 +272,7 @@ def init_db():
             is_read INTEGER DEFAULT 0
         )
     """)
+    _add_column_if_missing(conn, "notifications", "shop_id INTEGER")
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS settings (
@@ -243,62 +283,66 @@ def init_db():
 
     conn.commit()
 
-    # seed default admin
-    c.execute("SELECT COUNT(*) AS n FROM users WHERE role='admin'")
-    if c.fetchone()["n"] == 0:
-        c.execute(
-            "INSERT INTO users (username,password,role,name,phone) VALUES (?,?,?,?,?)",
-            ("admin", hash_pw("admin123"), "admin", "Owner", "")
-        )
-    c.execute("SELECT COUNT(*) AS n FROM settings WHERE key='rate_per_kg'")
-    if c.fetchone()["n"] == 0:
-        c.execute("INSERT INTO settings (key,value) VALUES ('rate_per_kg','250')")
-
     if CRYPTO_AVAILABLE:
         c.execute("SELECT COUNT(*) AS n FROM settings WHERE key='secret_key'")
         if c.fetchone()["n"] == 0:
             c.execute("INSERT INTO settings (key,value) VALUES (?,?)", ("secret_key", Fernet.generate_key().decode()))
-
-    # seed default dairy products (milk rate carried over from the old single-rate setting)
-    c.execute("SELECT COUNT(*) AS n FROM products")
-    if c.fetchone()["n"] == 0:
-        milk_rate = float(c.execute("SELECT value FROM settings WHERE key='rate_per_kg'").fetchone()["value"])
-        default_products = [
-            ("دودھ (Milk)", "kg", milk_rate, 1),
-            ("دہی (Yogurt)", "kg", 300.0, 0),
-            ("مکھن (Butter)", "kg", 1200.0, 0),
-            ("دیسی گھی (Desi Ghee)", "kg", 2500.0, 0),
-            ("ملائی (Fresh Cream)", "kg", 600.0, 0),
-        ]
-        c.executemany(
-            "INSERT INTO products (name,unit,rate,is_default_quota_item) VALUES (?,?,?,?)",
-            default_products
-        )
-
     conn.commit()
 
-    # one-time migration: old single-product `deliveries` rows -> delivery_txns/delivery_items
-    c.execute("SELECT COUNT(*) AS n FROM delivery_txns")
-    already_migrated = c.fetchone()["n"] > 0
-    c.execute("SELECT COUNT(*) AS n FROM deliveries")
-    has_legacy = c.fetchone()["n"] > 0
-    if has_legacy and not already_migrated:
-        milk = c.execute("SELECT id, name, unit FROM products WHERE is_default_quota_item=1").fetchone()
-        for row in c.execute("SELECT * FROM deliveries ORDER BY id").fetchall():
-            cur = c.execute(
-                "INSERT INTO delivery_txns (customer_id,rider_id,delivery_date,status,total_amount,verified_via,timestamp) "
-                "VALUES (?,?,?,?,?,?,?)",
-                (row["customer_id"], row["rider_id"], row["delivery_date"], row["status"], row["amount"], row["verified_via"], row["timestamp"])
-            )
-            txn_id = cur.lastrowid
-            if row["quantity_kg"] and row["quantity_kg"] > 0:
-                c.execute(
-                    "INSERT INTO delivery_items (transaction_id,product_id,product_name,unit,quantity,rate,amount) VALUES (?,?,?,?,?,?,?)",
-                    (txn_id, milk["id"] if milk else None, milk["name"] if milk else "دودھ", milk["unit"] if milk else "kg",
-                     row["quantity_kg"], row["rate"], row["amount"])
-                )
+    # ---- one-time migration: pre-multi-tenant data -> "Default Shop" ----
+    c.execute("SELECT COUNT(*) AS n FROM shops")
+    no_shops_yet = c.fetchone()["n"] == 0
+    c.execute("SELECT COUNT(*) AS n FROM users WHERE role='admin' AND shop_id IS NULL")
+    has_legacy_admin = c.fetchone()["n"] > 0
+
+    if no_shops_yet and has_legacy_admin:
+        now = datetime.now()
+        cur = c.execute(
+            "INSERT INTO shops (name,status,license_expires_at,created_at) VALUES (?,?,?,?)",
+            ("My Shop", "active", (now + timedelta(days=365)).isoformat(), now.isoformat())
+        )
+        default_shop_id = cur.lastrowid
+        for tbl in ["users", "customers", "riders", "products", "delivery_txns", "notifications"]:
+            c.execute(f"UPDATE {tbl} SET shop_id=? WHERE shop_id IS NULL", (default_shop_id,))
         conn.commit()
 
+    # seed a master admin if none exists yet
+    c.execute("SELECT COUNT(*) AS n FROM users WHERE role='master_admin'")
+    if c.fetchone()["n"] == 0:
+        c.execute(
+            "INSERT INTO users (username,password,role,name,phone,shop_id) VALUES (?,?,?,?,?,NULL)",
+            ("masteradmin", hash_pw("master123"), "master_admin", "Master Admin", "")
+        )
+    conn.commit()
+
+    # if there are truly no shops and no legacy admin (fresh install), seed one demo shop + admin
+    c.execute("SELECT COUNT(*) AS n FROM shops")
+    if c.fetchone()["n"] == 0:
+        now = datetime.now()
+        cur = c.execute(
+            "INSERT INTO shops (name,status,trial_end_date,created_at) VALUES (?,?,?,?)",
+            ("Demo Shop", "trial", (now + timedelta(days=15)).isoformat(), now.isoformat())
+        )
+        demo_shop_id = cur.lastrowid
+        c.execute(
+            "INSERT INTO users (username,password,role,name,phone,shop_id) VALUES (?,?,?,?,?,?)",
+            ("admin", hash_pw("admin123"), "admin", "Owner", "", demo_shop_id)
+        )
+        c.executemany(
+            "INSERT INTO products (name,unit,rate,is_default_quota_item,shop_id) VALUES (?,?,?,?,?)",
+            [(n, u, r, d, demo_shop_id) for n, u, r, d in DEFAULT_PRODUCTS]
+        )
+        conn.commit()
+
+    # backfill products for any shop that somehow has none (defensive)
+    for shop in c.execute("SELECT id FROM shops").fetchall():
+        cnt = c.execute("SELECT COUNT(*) AS n FROM products WHERE shop_id=?", (shop["id"],)).fetchone()["n"]
+        if cnt == 0:
+            c.executemany(
+                "INSERT INTO products (name,unit,rate,is_default_quota_item,shop_id) VALUES (?,?,?,?,?)",
+                [(n, u, r, d, shop["id"]) for n, u, r, d in DEFAULT_PRODUCTS]
+            )
+    conn.commit()
     conn.close()
 
 
@@ -309,49 +353,133 @@ def get_setting(key, default=None):
     return row["value"] if row else default
 
 
-def set_setting(key, value):
+# ----------------------------- SHOPS / LICENSING -----------------------------
+
+def get_shop(shop_id):
+    if not shop_id:
+        return None
     conn = get_conn()
-    conn.execute(
-        "INSERT INTO settings (key,value) VALUES (?,?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (key, str(value))
-    )
-    conn.commit()
-    conn.close()
-
-
-# ----------------------------- PRODUCTS -----------------------------
-
-def get_products(active_only=True):
-    conn = get_conn()
-    q = "SELECT * FROM products"
-    if active_only:
-        q += " WHERE active=1"
-    q += " ORDER BY is_default_quota_item DESC, name"
-    rows = conn.execute(q).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-
-def get_default_quota_product():
-    conn = get_conn()
-    row = conn.execute("SELECT * FROM products WHERE is_default_quota_item=1 AND active=1 LIMIT 1").fetchone()
+    row = conn.execute("SELECT * FROM shops WHERE id=?", (shop_id,)).fetchone()
     conn.close()
     return dict(row) if row else None
 
 
-def add_product(name, unit, rate):
+def random_key():
+    chars = string.ascii_uppercase + string.digits
+    return "-".join("".join(secrets.choice(chars) for _ in range(4)) for _ in range(3))
+
+
+def create_shop(name, admin_username, admin_password, admin_name, trial_days=15):
     conn = get_conn()
-    conn.execute("INSERT INTO products (name,unit,rate) VALUES (?,?,?)", (name, unit, rate))
+    now = datetime.now()
+    cur = conn.execute(
+        "INSERT INTO shops (name,status,trial_end_date,created_at) VALUES (?,?,?,?)",
+        (name, "trial", (now + timedelta(days=trial_days)).isoformat(), now.isoformat())
+    )
+    shop_id = cur.lastrowid
+    conn.execute(
+        "INSERT INTO users (username,password,role,name,shop_id) VALUES (?,?,?,?,?)",
+        (admin_username, hash_pw(admin_password), "admin", admin_name, shop_id)
+    )
+    conn.executemany(
+        "INSERT INTO products (name,unit,rate,is_default_quota_item,shop_id) VALUES (?,?,?,?,?)",
+        [(n, u, r, d, shop_id) for n, u, r, d in DEFAULT_PRODUCTS]
+    )
+    conn.commit()
+    conn.close()
+    return shop_id
+
+
+def generate_license_key(shop_id, duration_days=365):
+    key_code = random_key()
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO license_keys (shop_id,key_code,duration_days,created_at) VALUES (?,?,?,?)",
+        (shop_id, key_code, duration_days, datetime.now().isoformat())
+    )
+    conn.commit()
+    conn.close()
+    return key_code
+
+
+def activate_license_key(shop_id, key_code):
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT * FROM license_keys WHERE shop_id=? AND key_code=? AND is_used=0",
+        (shop_id, key_code.strip())
+    ).fetchone()
+    if not row:
+        conn.close()
+        return False, "غلط یا پہلے سے استعمال شدہ ایکٹیویشن کی۔"
+    new_expiry = (datetime.now() + timedelta(days=row["duration_days"])).isoformat()
+    conn.execute("UPDATE license_keys SET is_used=1, used_at=? WHERE id=?", (datetime.now().isoformat(), row["id"]))
+    conn.execute("UPDATE shops SET status='active', license_expires_at=? WHERE id=?", (new_expiry, shop_id))
+    conn.commit()
+    conn.close()
+    return True, new_expiry
+
+
+def check_shop_access(shop_id):
+    shop = get_shop(shop_id)
+    if not shop:
+        return False, "شاپ نہیں ملی۔"
+    now = datetime.now()
+    if shop["status"] == "suspended":
+        return False, "یہ اکاؤنٹ ماسٹر ایڈمن کی طرف سے معطل کیا گیا ہے۔"
+    if shop["status"] == "trial":
+        if shop["trial_end_date"] and datetime.fromisoformat(shop["trial_end_date"]) < now:
+            conn = get_conn()
+            conn.execute("UPDATE shops SET status='expired' WHERE id=?", (shop_id,))
+            conn.commit()
+            conn.close()
+            return False, "15 دن کا مفت ٹرائل ختم ہو چکا ہے۔"
+        return True, None
+    if shop["status"] == "active":
+        if shop["license_expires_at"] and datetime.fromisoformat(shop["license_expires_at"]) < now:
+            conn = get_conn()
+            conn.execute("UPDATE shops SET status='expired' WHERE id=?", (shop_id,))
+            conn.commit()
+            conn.close()
+            return False, "لائسنس کی مدت ختم ہو چکی ہے۔"
+        return True, None
+    return False, "لائسنس/ٹرائل ختم ہو چکا ہے۔ رینیوول کی درکار ہے۔"
+
+
+# ----------------------------- PRODUCTS -----------------------------
+
+def get_products(shop_id, active_only=True):
+    conn = get_conn()
+    q = "SELECT * FROM products WHERE shop_id=?"
+    params = [shop_id]
+    if active_only:
+        q += " AND active=1"
+    q += " ORDER BY is_default_quota_item DESC, name"
+    rows = conn.execute(q, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_default_quota_product(shop_id):
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT * FROM products WHERE is_default_quota_item=1 AND active=1 AND shop_id=? LIMIT 1", (shop_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def add_product(shop_id, name, unit, rate):
+    conn = get_conn()
+    conn.execute("INSERT INTO products (name,unit,rate,shop_id) VALUES (?,?,?,?)", (name, unit, rate, shop_id))
     conn.commit()
     conn.close()
 
 
-def update_product(product_id, name, unit, rate, active):
+def update_product(product_id, shop_id, name, unit, rate, active):
     conn = get_conn()
     conn.execute(
-        "UPDATE products SET name=?, unit=?, rate=?, active=? WHERE id=?",
-        (name, unit, rate, 1 if active else 0, product_id)
+        "UPDATE products SET name=?, unit=?, rate=?, active=? WHERE id=? AND shop_id=?",
+        (name, unit, rate, 1 if active else 0, product_id, shop_id)
     )
     conn.commit()
     conn.close()
@@ -377,49 +505,50 @@ def generate_customer_qr_token(customer_id: int) -> str:
     return token
 
 
-def verify_customer_qr(scanned_data: str):
-    """Mirrors POST /verify-customer-qr."""
+def verify_customer_qr(scanned_data: str, shop_id: int):
+    """Mirrors POST /verify-customer-qr — scoped to the scanning rider's shop
+    so a QR from a different tenant can never match."""
     conn = get_conn()
     f = get_fernet()
     if f is not None:
         try:
             customer_id = int(f.decrypt(scanned_data.encode()).decode())
-            row = conn.execute("SELECT * FROM customers WHERE id=? AND active=1", (customer_id,)).fetchone()
+            row = conn.execute("SELECT * FROM customers WHERE id=? AND active=1 AND shop_id=?", (customer_id, shop_id)).fetchone()
             if row:
                 conn.close()
                 return dict(row)
         except (InvalidToken, ValueError, Exception):
             pass
-    row = conn.execute("SELECT * FROM customers WHERE code=? AND active=1", (scanned_data,)).fetchone()
+    row = conn.execute("SELECT * FROM customers WHERE code=? AND active=1 AND shop_id=?", (scanned_data, shop_id)).fetchone()
     conn.close()
     return dict(row) if row else None
 
 
 # ----------------------------- NOTIFICATIONS -----------------------------
 
-def push_notification(customer_id, message, audience="customer", delivery_id=None):
+def push_notification(customer_id, message, shop_id, audience="customer", delivery_id=None):
     conn = get_conn()
     conn.execute(
-        "INSERT INTO notifications (customer_id,audience,message,delivery_id,created_at) VALUES (?,?,?,?,?)",
-        (customer_id, audience, message, delivery_id, datetime.now().isoformat())
+        "INSERT INTO notifications (customer_id,audience,message,delivery_id,created_at,shop_id) VALUES (?,?,?,?,?,?)",
+        (customer_id, audience, message, delivery_id, datetime.now().isoformat(), shop_id)
     )
     conn.commit()
     conn.close()
 
 
-def get_notifications(audience, customer_id=None, limit=20):
+def get_notifications(audience, shop_id, customer_id=None, limit=20):
     conn = get_conn()
     if audience == "customer":
         rows = conn.execute(
-            "SELECT * FROM notifications WHERE audience='customer' AND customer_id=? ORDER BY created_at DESC LIMIT ?",
-            (customer_id, limit)
+            "SELECT * FROM notifications WHERE audience='customer' AND customer_id=? AND shop_id=? ORDER BY created_at DESC LIMIT ?",
+            (customer_id, shop_id, limit)
         ).fetchall()
     else:
         rows = conn.execute(
             "SELECT n.*, c.name AS customer_name FROM notifications n "
             "LEFT JOIN customers c ON c.id=n.customer_id "
-            "WHERE n.audience='admin' ORDER BY n.created_at DESC LIMIT ?",
-            (limit,)
+            "WHERE n.audience='admin' AND n.shop_id=? ORDER BY n.created_at DESC LIMIT ?",
+            (shop_id, limit)
         ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -439,7 +568,7 @@ def rider_cash_in_hand(rider_id: int) -> float:
     return round(collected - settled, 2)
 
 
-def record_cash_collection(rider_id: int, customer_id, amount: float, note: str = ""):
+def record_cash_collection(rider_id: int, customer_id, amount: float, shop_id, note: str = ""):
     conn = get_conn()
     conn.execute(
         "INSERT INTO cash_collections (rider_id,customer_id,amount,note,timestamp) VALUES (?,?,?,?,?)",
@@ -453,7 +582,7 @@ def record_cash_collection(rider_id: int, customer_id, amount: float, note: str 
     conn.commit()
     conn.close()
     if customer_id:
-        push_notification(customer_id, f"آپ کی Rs {amount:.0f} نقد وصولی رائیڈر کے ذریعے درج ہو گئی", audience="customer")
+        push_notification(customer_id, f"آپ کی Rs {amount:.0f} نقد وصولی رائیڈر کے ذریعے درج ہو گئی", shop_id, audience="customer")
 
 
 def settle_rider_cash(rider_id: int, amount: float, note: str = ""):
@@ -472,16 +601,13 @@ def items_summary_text(cart_items):
     return ", ".join(f"{it['product_name']} {it['qty']}{it['unit']}" for it in cart_items)
 
 
-def confirm_delivery(customer_id, rider_id, cart_items, status="delivered"):
-    """Mirrors POST /confirm-delivery. One-tap, multi-product: no PIN wait.
-    cart_items: list of {product_id, product_name, unit, qty, rate}
-    """
+def confirm_delivery(customer_id, rider_id, cart_items, shop_id, status="delivered"):
     total_amount = round(sum(it["qty"] * it["rate"] for it in cart_items), 2)
     conn = get_conn()
     cur = conn.execute(
-        "INSERT INTO delivery_txns (customer_id,rider_id,delivery_date,status,total_amount,verified_via,timestamp) "
-        "VALUES (?,?,?,?,?,?,?)",
-        (customer_id, rider_id, date.today().isoformat(), status, total_amount, "QR Scan", datetime.now().isoformat())
+        "INSERT INTO delivery_txns (customer_id,rider_id,delivery_date,status,total_amount,verified_via,timestamp,shop_id) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (customer_id, rider_id, date.today().isoformat(), status, total_amount, "QR Scan", datetime.now().isoformat(), shop_id)
     )
     txn_id = cur.lastrowid
     for it in cart_items:
@@ -495,26 +621,26 @@ def confirm_delivery(customer_id, rider_id, cart_items, status="delivered"):
 
     if status == "delivered" and cart_items:
         summary = items_summary_text(cart_items)
-        push_notification(customer_id, f"آپ کے ہاں {summary} ڈیلیور ہوا — رقم Rs {total_amount:.0f}", audience="customer", delivery_id=txn_id)
-        push_notification(customer_id, f"ڈیلیوری کنفرم ہوئی — {summary} / Rs {total_amount:.0f}", audience="admin", delivery_id=txn_id)
+        push_notification(customer_id, f"آپ کے ہاں {summary} ڈیلیور ہوا — رقم Rs {total_amount:.0f}", shop_id, audience="customer", delivery_id=txn_id)
+        push_notification(customer_id, f"ڈیلیوری کنفرم ہوئی — {summary} / Rs {total_amount:.0f}", shop_id, audience="admin", delivery_id=txn_id)
     return txn_id
 
 
-def mark_missed(customer_id, rider_id):
+def mark_missed(customer_id, rider_id, shop_id):
     conn = get_conn()
     cur = conn.execute(
-        "INSERT INTO delivery_txns (customer_id,rider_id,delivery_date,status,total_amount,verified_via,timestamp) "
-        "VALUES (?,?,?,?,?,?,?)",
-        (customer_id, rider_id, date.today().isoformat(), "missed", 0, "n/a", datetime.now().isoformat())
+        "INSERT INTO delivery_txns (customer_id,rider_id,delivery_date,status,total_amount,verified_via,timestamp,shop_id) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (customer_id, rider_id, date.today().isoformat(), "missed", 0, "n/a", datetime.now().isoformat(), shop_id)
     )
     txn_id = cur.lastrowid
     conn.commit()
     conn.close()
-    push_notification(customer_id, "آج ڈیلیوری نہیں ہوئی (ناغہ درج)", audience="customer", delivery_id=txn_id)
-    push_notification(customer_id, "ناغہ درج ہوا", audience="admin", delivery_id=txn_id)
+    push_notification(customer_id, "آج ڈیلیوری نہیں ہوئی (ناغہ درج)", shop_id, audience="customer", delivery_id=txn_id)
+    push_notification(customer_id, "ناغہ درج ہوا", shop_id, audience="admin", delivery_id=txn_id)
 
 
-def get_transactions(customer_id=None, rider_id=None, date_filter=None, month_filter=None):
+def get_transactions(shop_id, customer_id=None, rider_id=None, date_filter=None, month_filter=None):
     q = (
         "SELECT dt.*, c.name AS customer_name, r.name AS rider_name, "
         "GROUP_CONCAT(di.product_name || ' ' || di.quantity || di.unit, ', ') AS items_summary "
@@ -522,9 +648,9 @@ def get_transactions(customer_id=None, rider_id=None, date_filter=None, month_fi
         "JOIN customers c ON c.id=dt.customer_id "
         "JOIN riders r ON r.id=dt.rider_id "
         "LEFT JOIN delivery_items di ON di.transaction_id=dt.id "
-        "WHERE 1=1"
+        "WHERE dt.shop_id=?"
     )
-    params = []
+    params = [shop_id]
     if customer_id:
         q += " AND dt.customer_id=?"
         params.append(customer_id)
@@ -593,13 +719,14 @@ def logout_button():
 
 # ----------------------------- SHARED HELPERS -----------------------------
 
-def get_customers(active_only=True):
+def get_customers(shop_id, active_only=True):
     conn = get_conn()
-    q = "SELECT * FROM customers"
+    q = "SELECT * FROM customers WHERE shop_id=?"
+    params = [shop_id]
     if active_only:
-        q += " WHERE active=1"
+        q += " AND active=1"
     q += " ORDER BY name"
-    rows = conn.execute(q).fetchall()
+    rows = conn.execute(q, params).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -625,17 +752,126 @@ def customer_balance(customer_id):
     return round(total_amount - total_paid, 2)
 
 
+# ----------------------------- THEME / BRANDING -----------------------------
+
+def apply_theme(shop=None):
+    primary = (shop.get("primary_color") if shop else None) or "#3B6EA5"
+    st.markdown(f"""
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap');
+
+        html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"] {{
+            background-color: #FFFFFF !important;
+            color: #1F2A37 !important;
+            font-family: 'Poppins', sans-serif !important;
+        }}
+        [data-testid="stHeader"] {{ background-color: #FFFFFF !important; }}
+        [data-testid="stSidebar"] {{ background-color: #F1F3F5 !important; }}
+
+        .naba-banner {{
+            background: linear-gradient(90deg, {primary}CC 0%, {primary} 60%, {primary}AA 100%);
+            padding: 18px 24px;
+            border-radius: 14px;
+            margin-bottom: 18px;
+            box-shadow: 0 4px 14px rgba(0,0,0,0.15);
+        }}
+        .naba-banner h1 {{ color: #FFFFFF !important; margin: 0; font-size: 26px; font-weight: 700; }}
+        .naba-banner p {{ color: #EAF0FA !important; margin: 2px 0 0 0; font-size: 13px; }}
+
+        [data-testid="stMetric"] {{
+            background-color: #F8F9FB !important;
+            padding: 14px !important;
+            border-radius: 14px !important;
+            border: 1px solid #E6E9EE !important;
+            box-shadow: 0 2px 6px rgba(31,42,55,0.05);
+        }}
+        [data-testid="stMetricLabel"] {{ color: #6B7280 !important; }}
+        [data-testid="stMetricValue"] {{ color: #1F2A37 !important; font-weight: 600; }}
+        [data-testid="stExpander"] {{
+            border-radius: 12px !important;
+            border: 1px solid #E6E9EE !important;
+            box-shadow: 0 2px 6px rgba(31,42,55,0.04);
+        }}
+
+        h1, h2, h3, h4, h5 {{ color: #1F2A37; font-weight: 600; }}
+        input, textarea, [data-baseweb="select"] > div {{ border-radius: 10px !important; }}
+
+        .stButton > button {{
+            border-radius: 10px !important;
+            border-color: {primary} !important;
+            color: {primary} !important;
+            font-weight: 500;
+            transition: all 0.15s ease-in-out;
+        }}
+        .stButton > button:hover {{
+            background-color: {primary}1A !important;
+            transform: translateY(-1px);
+        }}
+        .stButton > button[kind="primary"] {{
+            background-color: {primary} !important;
+            border-color: {primary} !important;
+            color: #FFFFFF !important;
+            box-shadow: 0 3px 8px rgba(0,0,0,0.2);
+        }}
+        [data-testid="stTabs"] button[aria-selected="true"] {{
+            color: {primary} !important;
+            border-bottom-color: {primary} !important;
+            font-weight: 600;
+        }}
+        [data-baseweb="tab-highlight"] {{ background-color: {primary} !important; }}
+        [data-baseweb="tab-list"] {{ border-bottom-color: #E2E5E9 !important; }}
+        a, a:visited {{ color: {primary} !important; }}
+    </style>
+    """, unsafe_allow_html=True)
+
+
+def render_banner(shop=None):
+    emoji = (shop.get("logo_emoji") if shop else None) or "🥛"
+    text = (shop.get("logo_text") if shop else None) or "Doodh Delivery System"
+    st.markdown(f"""
+    <div class="naba-banner">
+        <h1>{emoji} {text}</h1>
+        <p>NABA TECH BY KALEEM ULLAH SHARIF</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+# ----------------------------- LICENSE LOCK SCREEN -----------------------------
+
+def license_lock_screen(user):
+    shop = get_shop(user["shop_id"])
+    _, reason = check_shop_access(user["shop_id"])
+    st.error(f"🔒 {shop['name'] if shop else 'یہ شاپ'} کی رسائی بند ہے۔")
+    if reason:
+        st.warning(reason)
+
+    if user["role"] == "admin":
+        st.subheader("🔑 ایکٹیویشن کی درج کریں")
+        st.caption("یہ کی آپ کو NABA TECH / ماسٹر ایڈمن کی طرف سے فراہم کی جائے گی۔")
+        key_input = st.text_input("Activation Key")
+        if st.button("✅ ری ایکٹیویٹ کریں", type="primary"):
+            ok, result = activate_license_key(user["shop_id"], key_input)
+            if ok:
+                st.success(f"سافٹ ویئر دوبارہ فعال ہو گیا! میعاد: {format_ts(result)} تک۔")
+                st.rerun()
+            else:
+                st.error(result)
+    else:
+        st.info("براہ کرم اپنی شاپ کے ایڈمن سے رابطہ کریں تاکہ لائسنس رینیو ہو سکے۔")
+
+
 # ----------------------------- RIDER PANEL -----------------------------
 
 def rider_panel(user):
+    shop_id = user["shop_id"]
     rider = get_rider_by_user(user["id"])
     if not rider:
         st.error("آپ کا رائیڈر پروفائل نہیں ملا۔ ایڈمن سے رابطہ کریں۔")
         return
 
     st.header("🛵 رائیڈر پینل")
-    products = get_products()
-    milk = get_default_quota_product()
+    products = get_products(shop_id)
+    milk = get_default_quota_product(shop_id)
 
     for key, default in [("cart", []), ("selected_customer", None)]:
         if key not in st.session_state:
@@ -648,7 +884,7 @@ def rider_panel(user):
     )
 
     with tab_deliver:
-        customers = get_customers()
+        customers = get_customers(shop_id)
 
         st.subheader("1️⃣ QR اسکین کریں")
         if QR_SCAN_AVAILABLE:
@@ -658,7 +894,7 @@ def rider_panel(user):
                 results = qr_decode(img)
                 if results:
                     scanned = results[0].data.decode("utf-8")
-                    cust = verify_customer_qr(scanned)
+                    cust = verify_customer_qr(scanned, shop_id)
                     if cust:
                         if not st.session_state.selected_customer or st.session_state.selected_customer["id"] != cust["id"]:
                             st.session_state.selected_customer = cust
@@ -730,7 +966,7 @@ def rider_panel(user):
 
                 st.subheader("4️⃣ کنفرم کریں")
                 if st.button("✅ Confirm Delivery", type="primary", use_container_width=True):
-                    confirm_delivery(cust["id"], rider["id"], st.session_state.cart)
+                    confirm_delivery(cust["id"], rider["id"], st.session_state.cart, shop_id)
                     st.session_state.cart = []
                     st.session_state.selected_customer = None
                     st.success("✅ ڈیلیوری فوری سیو اور سنک ہو گئی — اونر ڈیش بورڈ اور کسٹمر پینل اپڈیٹ ہو گئے۔")
@@ -740,7 +976,7 @@ def rider_panel(user):
 
             st.divider()
             if st.button("❌ آج ناغہ (Missed) مارک کریں"):
-                mark_missed(cust["id"], rider["id"])
+                mark_missed(cust["id"], rider["id"], shop_id)
                 st.session_state.selected_customer = None
                 st.session_state.cart = []
                 st.success("ناغہ درج کر دیا گیا اور کسٹمر/اونر کو مطلع کر دیا گیا۔")
@@ -751,7 +987,7 @@ def rider_panel(user):
     with tab_cash:
         st.subheader("💵 کسٹمر سے نقد وصولی درج کریں")
         st.caption(f"موجودہ نقدی آپ کے پاس: Rs {rider_cash_in_hand(rider['id']):.0f}")
-        customers = get_customers()
+        customers = get_customers(shop_id)
         if customers:
             names = [f"{c['name']} (بقیہ Rs {customer_balance(c['id']):.0f})" for c in customers]
             idx = st.selectbox("کسٹمر", range(len(names)), format_func=lambda i: names[i], key="cash_cust_select")
@@ -759,7 +995,7 @@ def rider_panel(user):
             note = st.text_input("نوٹ (اختیاری)", key="cash_note")
             if st.button("💰 نقد وصولی درج کریں", type="primary"):
                 if amt > 0:
-                    record_cash_collection(rider["id"], customers[idx]["id"], amt, note)
+                    record_cash_collection(rider["id"], customers[idx]["id"], amt, shop_id, note)
                     st.success(f"Rs {amt:.0f} نقد وصولی درج ہو گئی — کسٹمر کا کھاتہ اپڈیٹ ہو گیا اور آپ کی نقدی میں شامل ہو گئی۔")
                     st.rerun()
                 else:
@@ -790,7 +1026,7 @@ def rider_panel(user):
 
     with tab_history:
         today = date.today().isoformat()
-        rows = get_transactions(rider_id=rider["id"], date_filter=today)
+        rows = get_transactions(shop_id, rider_id=rider["id"], date_filter=today)
         if rows:
             for r in rows:
                 r["timestamp"] = format_ts(r["timestamp"])
@@ -804,11 +1040,18 @@ def rider_panel(user):
 # ----------------------------- ADMIN PANEL -----------------------------
 
 def admin_panel(user):
+    shop_id = user["shop_id"]
+    shop = get_shop(shop_id)
     st.header("🧑‍💼 اونر / ایڈمن ڈیش بورڈ")
+
+    if shop:
+        badge = {"trial": "🟡 ٹرائل", "active": "🟢 فعال", "expired": "🔴 ختم شدہ", "suspended": "⛔ معطل"}.get(shop["status"], shop["status"])
+        expiry = shop.get("license_expires_at") or shop.get("trial_end_date")
+        st.caption(f"{badge} — {shop['name']}" + (f" — میعاد: {format_ts(expiry)}" if expiry else ""))
 
     tabs = st.tabs([
         "📡 لائیو ٹریکنگ", "🧀 پروڈکٹس / ریٹس", "👥 کسٹمرز", "🛵 رائیڈرز",
-        "📒 کھاتہ / لیجر", "💵 وصولی درج کریں", "🧾 کیش سیٹلمنٹ", "🔑 پاسورڈز"
+        "📒 کھاتہ / لیجر", "💵 وصولی درج کریں", "🧾 کیش سیٹلمنٹ", "🔑 پاسورڈز", "🎨 برانڈنگ"
     ])
 
     # ---- Live tracking + admin notifications ----
@@ -819,7 +1062,7 @@ def admin_panel(user):
             st.rerun()
 
         today = date.today().isoformat()
-        rows = get_transactions(date_filter=today)
+        rows = get_transactions(shop_id, date_filter=today)
         if rows:
             display_rows = []
             for r in rows:
@@ -838,7 +1081,7 @@ def admin_panel(user):
 
         st.divider()
         st.subheader("🔔 حالیہ نوٹیفکیشنز")
-        notifs = get_notifications("admin")
+        notifs = get_notifications("admin", shop_id)
         if notifs:
             for n in notifs:
                 st.caption(f"[{format_ts(n['created_at'])}] {n.get('customer_name') or '—'}: {n['message']}")
@@ -857,27 +1100,23 @@ def admin_panel(user):
                 if not p_name:
                     st.error("پروڈکٹ کا نام درج کریں۔")
                 else:
-                    try:
-                        add_product(p_name, p_unit, p_rate)
-                        st.success(f"پروڈکٹ '{p_name}' شامل ہو گیا۔")
-                        st.rerun()
-                    except sqlite3.IntegrityError:
-                        st.error("یہ پروڈکٹ پہلے سے موجود ہے۔")
+                    add_product(shop_id, p_name, p_unit, p_rate)
+                    st.success(f"پروڈکٹ '{p_name}' شامل ہو گیا۔")
+                    st.rerun()
 
         st.divider()
         st.subheader("موجودہ پروڈکٹس")
-        all_products = get_products(active_only=False)
+        all_products = get_products(shop_id, active_only=False)
         for p in all_products:
             with st.expander(f"{'⭐ ' if p['is_default_quota_item'] else ''}{p['name']} — Rs {p['rate']:.0f}/{p['unit']}"):
                 with st.form(f"edit_product_{p['id']}"):
                     e_name = st.text_input("نام", value=p["name"], key=f"pname_{p['id']}")
-                    e_unit = st.selectbox("یونٹ", ["kg", "liter", "packet", "piece", "dozen"],
-                                           index=["kg", "liter", "packet", "piece", "dozen"].index(p["unit"]) if p["unit"] in ["kg", "liter", "packet", "piece", "dozen"] else 0,
-                                           key=f"punit_{p['id']}")
+                    unit_opts = ["kg", "liter", "packet", "piece", "dozen"]
+                    e_unit = st.selectbox("یونٹ", unit_opts, index=unit_opts.index(p["unit"]) if p["unit"] in unit_opts else 0, key=f"punit_{p['id']}")
                     e_rate = st.number_input("ریٹ", min_value=0.0, value=float(p["rate"]), step=10.0, key=f"prate_{p['id']}")
                     e_active = st.checkbox("فعال (Active)", value=bool(p["active"]), key=f"pactive_{p['id']}")
                     if st.form_submit_button("محفوظ کریں"):
-                        update_product(p["id"], e_name, e_unit, e_rate, e_active)
+                        update_product(p["id"], shop_id, e_name, e_unit, e_rate, e_active)
                         st.success("اپڈیٹ ہو گیا — رائیڈر اور کسٹمر پینل پر فوراً اثر ہوگا۔")
                         st.rerun()
 
@@ -903,13 +1142,13 @@ def admin_panel(user):
                         user_id = None
                         if make_login and c_user and c_pass:
                             cur = conn.execute(
-                                "INSERT INTO users (username,password,role,name,phone) VALUES (?,?,?,?,?)",
-                                (c_user, hash_pw(c_pass), "customer", c_name, c_phone)
+                                "INSERT INTO users (username,password,role,name,phone,shop_id) VALUES (?,?,?,?,?,?)",
+                                (c_user, hash_pw(c_pass), "customer", c_name, c_phone, shop_id)
                             )
                             user_id = cur.lastrowid
                         cur2 = conn.execute(
-                            "INSERT INTO customers (user_id,name,address,phone,code,daily_quota_kg) VALUES (?,?,?,?,?,?)",
-                            (user_id, c_name, c_address, c_phone, c_code, c_quota)
+                            "INSERT INTO customers (user_id,name,address,phone,code,daily_quota_kg,shop_id) VALUES (?,?,?,?,?,?,?)",
+                            (user_id, c_name, c_address, c_phone, c_code, c_quota, shop_id)
                         )
                         new_id = cur2.lastrowid
                         conn.commit()
@@ -922,7 +1161,7 @@ def admin_panel(user):
 
         st.divider()
         st.subheader("موجودہ کسٹمرز")
-        customers = get_customers()
+        customers = get_customers(shop_id)
         if customers:
             for c in customers:
                 col1, col2, col3 = st.columns([3, 2, 2])
@@ -961,12 +1200,12 @@ def admin_panel(user):
                     conn = get_conn()
                     try:
                         cur = conn.execute(
-                            "INSERT INTO users (username,password,role,name,phone) VALUES (?,?,?,?,?)",
-                            (r_user, hash_pw(r_pass), "rider", r_name, r_phone)
+                            "INSERT INTO users (username,password,role,name,phone,shop_id) VALUES (?,?,?,?,?,?)",
+                            (r_user, hash_pw(r_pass), "rider", r_name, r_phone, shop_id)
                         )
                         conn.execute(
-                            "INSERT INTO riders (user_id,name,phone) VALUES (?,?,?)",
-                            (cur.lastrowid, r_name, r_phone)
+                            "INSERT INTO riders (user_id,name,phone,shop_id) VALUES (?,?,?,?)",
+                            (cur.lastrowid, r_name, r_phone, shop_id)
                         )
                         conn.commit()
                         st.success(f"رائیڈر '{r_name}' شامل ہو گیا۔")
@@ -977,7 +1216,7 @@ def admin_panel(user):
 
         st.divider()
         conn = get_conn()
-        riders = conn.execute("SELECT * FROM riders WHERE active=1").fetchall()
+        riders = conn.execute("SELECT * FROM riders WHERE active=1 AND shop_id=?", (shop_id,)).fetchall()
         conn.close()
         if riders:
             st.dataframe(pd.DataFrame([dict(r) for r in riders])[["name", "phone"]], hide_index=True, use_container_width=True)
@@ -985,14 +1224,14 @@ def admin_panel(user):
     # ---- Ledger ----
     with tabs[4]:
         st.subheader("ماہانہ کھاتہ / لیجر")
-        customers = get_customers()
+        customers = get_customers(shop_id)
         if customers:
             names = [c["name"] for c in customers]
             sel = st.selectbox("کسٹمر منتخب کریں", range(len(names)), format_func=lambda i: names[i])
             cust = customers[sel]
 
             month = st.text_input("مہینہ (YYYY-MM)", value=date.today().strftime("%Y-%m"))
-            rows = get_transactions(customer_id=cust["id"], month_filter=month)
+            rows = get_transactions(shop_id, customer_id=cust["id"], month_filter=month)
             conn = get_conn()
             pay_rows = conn.execute(
                 "SELECT * FROM payments WHERE customer_id=? AND payment_date LIKE ? ORDER BY payment_date",
@@ -1026,7 +1265,7 @@ def admin_panel(user):
     # ---- Record payment ----
     with tabs[5]:
         st.subheader("وصولی درج کریں")
-        customers = get_customers()
+        customers = get_customers(shop_id)
         if customers:
             names = [c["name"] for c in customers]
             sel = st.selectbox("کسٹمر", range(len(names)), format_func=lambda i: names[i], key="pay_cust")
@@ -1045,7 +1284,7 @@ def admin_panel(user):
                     )
                     conn.commit()
                     conn.close()
-                    push_notification(cust["id"], f"آپ کی Rs {amt:.0f} وصولی درج ہو گئی ({method})", audience="customer")
+                    push_notification(cust["id"], f"آپ کی Rs {amt:.0f} وصولی درج ہو گئی ({method})", shop_id, audience="customer")
                     st.success("وصولی درج ہو گئی۔")
                     st.rerun()
         else:
@@ -1055,7 +1294,7 @@ def admin_panel(user):
     with tabs[6]:
         st.subheader("🧾 رائیڈرز کی نقدی (Cash in Hand)")
         conn = get_conn()
-        riders = [dict(r) for r in conn.execute("SELECT * FROM riders WHERE active=1").fetchall()]
+        riders = [dict(r) for r in conn.execute("SELECT * FROM riders WHERE active=1 AND shop_id=?", (shop_id,)).fetchall()]
         conn.close()
 
         if riders:
@@ -1089,7 +1328,8 @@ def admin_panel(user):
             conn = get_conn()
             hist = conn.execute(
                 "SELECT cs.*, r.name AS rider_name FROM cash_settlements cs "
-                "JOIN riders r ON r.id=cs.rider_id ORDER BY cs.timestamp DESC LIMIT 50"
+                "JOIN riders r ON r.id=cs.rider_id WHERE r.shop_id=? ORDER BY cs.timestamp DESC LIMIT 50",
+                (shop_id,)
             ).fetchall()
             conn.close()
             if hist:
@@ -1109,7 +1349,8 @@ def admin_panel(user):
         st.subheader("🔑 کسی بھی یوزر کا پاسورڈ ری سیٹ کریں")
         conn = get_conn()
         login_users = conn.execute(
-            "SELECT * FROM users WHERE role IN ('rider','customer') AND active=1 ORDER BY role, name"
+            "SELECT * FROM users WHERE role IN ('rider','customer') AND active=1 AND shop_id=? ORDER BY role, name",
+            (shop_id,)
         ).fetchall()
         conn.close()
         login_users = [dict(u) for u in login_users]
@@ -1150,10 +1391,30 @@ def admin_panel(user):
         else:
             st.caption("ابھی کوئی رائیڈر/کسٹمر لاگ ان اکاؤنٹ موجود نہیں۔")
 
+    # ---- Branding (shop admin can tweak within their own shop) ----
+    with tabs[8]:
+        st.subheader("🎨 برانڈنگ")
+        st.caption("یہ رنگ اور لوگو صرف آپ کی اپنی شاپ پر لاگو ہوں گے۔")
+        if shop:
+            new_color = st.color_picker("پرائمری رنگ", value=shop.get("primary_color") or "#3B6EA5")
+            new_logo_emoji = st.text_input("لوگو ایموجی", value=shop.get("logo_emoji") or "🥛")
+            new_logo_text = st.text_input("لوگو ٹیکسٹ", value=shop.get("logo_text") or "Doodh Delivery System")
+            if st.button("محفوظ کریں", type="primary"):
+                conn = get_conn()
+                conn.execute(
+                    "UPDATE shops SET primary_color=?, logo_emoji=?, logo_text=? WHERE id=?",
+                    (new_color, new_logo_emoji, new_logo_text, shop_id)
+                )
+                conn.commit()
+                conn.close()
+                st.success("برانڈنگ محفوظ ہو گئی۔")
+                st.rerun()
+
 
 # ----------------------------- CUSTOMER PANEL -----------------------------
 
 def customer_panel(user):
+    shop_id = user["shop_id"]
     conn = get_conn()
     cust = conn.execute("SELECT * FROM customers WHERE user_id=?", (user["id"],)).fetchone()
     conn.close()
@@ -1166,10 +1427,10 @@ def customer_panel(user):
 
     col_rate, col_qr = st.columns([2, 1])
     with col_rate:
-        milk = get_default_quota_product()
+        milk = get_default_quota_product(shop_id)
         if milk:
             st.info(f"آج کا دودھ ریٹ: **Rs {milk['rate']:.0f} / {milk['unit']}**")
-        products = get_products()
+        products = get_products(shop_id)
         if products:
             st.caption(" | ".join(f"{p['name']}: Rs {p['rate']:.0f}/{p['unit']}" for p in products if not p["is_default_quota_item"]))
 
@@ -1188,7 +1449,7 @@ def customer_panel(user):
             st.caption(f"آپ کا شناختی کوڈ: `{cust['code']}`")
 
     month = date.today().strftime("%Y-%m")
-    rows = get_transactions(customer_id=cust["id"], month_filter=month)
+    rows = get_transactions(shop_id, customer_id=cust["id"], month_filter=month)
     conn = get_conn()
     pay_rows = conn.execute(
         "SELECT * FROM payments WHERE customer_id=? AND payment_date LIKE ? ORDER BY payment_date DESC",
@@ -1231,7 +1492,7 @@ def customer_panel(user):
         st.caption("اس مہینے کوئی وصولی درج نہیں ہوئی۔")
 
     st.subheader("🔔 نوٹیفکیشنز")
-    notifs = get_notifications("customer", customer_id=cust["id"])
+    notifs = get_notifications("customer", shop_id, customer_id=cust["id"])
     if notifs:
         for n in notifs:
             st.caption(f"[{format_ts(n['created_at'])}] {n['message']}")
@@ -1239,134 +1500,172 @@ def customer_panel(user):
         st.caption("کوئی نوٹیفکیشن نہیں۔")
 
 
+# ----------------------------- MASTER ADMIN PANEL -----------------------------
+
+def master_admin_panel(user):
+    st.header("👑 ماسٹر ایڈمن پینل")
+    tabs = st.tabs(["🏪 شاپس", "🔑 لائسنس کیز", "📊 مانیٹرنگ"])
+
+    with tabs[0]:
+        st.subheader("نئی شاپ بنائیں")
+        with st.form("new_shop"):
+            s_name = st.text_input("شاپ کا نام")
+            a_name = st.text_input("پہلے ایڈمن کا نام")
+            a_user = st.text_input("ایڈمن یوزرنیم")
+            a_pass = st.text_input("ایڈمن پاسورڈ", type="password")
+            trial_days = st.number_input("ٹرائل دن", min_value=1, value=15)
+            if st.form_submit_button("✅ شاپ بنائیں", type="primary"):
+                if not (s_name and a_name and a_user and a_pass):
+                    st.error("تمام فیلڈز درکار ہیں۔")
+                else:
+                    try:
+                        create_shop(s_name, a_user, a_pass, a_name, trial_days)
+                        st.success(f"'{s_name}' بن گئی — {trial_days} دن کا ٹرائل شروع۔ ایڈمن لاگ ان: {a_user}")
+                        st.rerun()
+                    except sqlite3.IntegrityError:
+                        st.error("یہ یوزرنیم پہلے سے موجود ہے۔")
+
+        st.divider()
+        st.subheader("موجودہ شاپس")
+        conn = get_conn()
+        shops = [dict(r) for r in conn.execute("SELECT * FROM shops ORDER BY created_at DESC").fetchall()]
+        conn.close()
+        for s in shops:
+            _, reason = check_shop_access(s["id"])
+            with st.expander(f"{s['name']} — {s['status'].upper()}"):
+                st.write(f"ٹرائل ختم: {format_ts(s['trial_end_date']) if s['trial_end_date'] else '—'}")
+                st.write(f"لائسنس ختم: {format_ts(s['license_expires_at']) if s['license_expires_at'] else '—'}")
+                if reason:
+                    st.warning(reason)
+
+                colA, colB = st.columns(2)
+                if colA.button("⏸️ معطل کریں", key=f"suspend_{s['id']}"):
+                    conn = get_conn()
+                    conn.execute("UPDATE shops SET status='suspended' WHERE id=?", (s["id"],))
+                    conn.commit()
+                    conn.close()
+                    st.rerun()
+                if colB.button("▶️ فعال کریں (1 سال)", key=f"activate_{s['id']}"):
+                    conn = get_conn()
+                    conn.execute(
+                        "UPDATE shops SET status='active', license_expires_at=? WHERE id=?",
+                        ((datetime.now() + timedelta(days=365)).isoformat(), s["id"])
+                    )
+                    conn.commit()
+                    conn.close()
+                    st.rerun()
+
+        if not shops:
+            st.caption("ابھی کوئی شاپ نہیں بنائی گئی۔")
+
+    with tabs[1]:
+        st.subheader("لائسنس کی جنریٹ کریں")
+        conn = get_conn()
+        shops = [dict(r) for r in conn.execute("SELECT * FROM shops ORDER BY name").fetchall()]
+        conn.close()
+        if shops:
+            names = [s["name"] for s in shops]
+            sel = st.selectbox("شاپ منتخب کریں", range(len(names)), format_func=lambda i: names[i])
+            dur = st.number_input("مدت (دن)", min_value=1, value=365)
+            if st.button("🔑 نئی کی جنریٹ کریں", type="primary"):
+                key_code = generate_license_key(shops[sel]["id"], dur)
+                st.success("نئی activation key بن گئی — کلائنٹ کو یہ دیں:")
+                st.code(key_code, language=None)
+
+            st.divider()
+            st.subheader("جاری شدہ کیز")
+            conn = get_conn()
+            keys = [dict(r) for r in conn.execute(
+                "SELECT lk.*, s.name AS shop_name FROM license_keys lk JOIN shops s ON s.id=lk.shop_id ORDER BY lk.created_at DESC LIMIT 50"
+            ).fetchall()]
+            conn.close()
+            if keys:
+                for k in keys:
+                    k["created_at"] = format_ts(k["created_at"])
+                    k["used_at"] = format_ts(k["used_at"]) if k["used_at"] else "—"
+                    k["is_used"] = "ہاں" if k["is_used"] else "نہیں"
+                df = pd.DataFrame(keys)[["shop_name", "key_code", "duration_days", "is_used", "created_at", "used_at"]]
+                df.columns = ["شاپ", "کی", "مدت (دن)", "استعمال شدہ", "بنی", "استعمال ہوئی"]
+                st.dataframe(df, use_container_width=True, hide_index=True)
+        else:
+            st.caption("پہلے شاپ بنائیں۔")
+
+    with tabs[2]:
+        st.subheader("📊 تمام شاپس کی آج کی ڈیلیوریز")
+        today = date.today().isoformat()
+        conn = get_conn()
+        rows = conn.execute(
+            "SELECT dt.*, s.name AS shop_name, c.name AS customer_name, r.name AS rider_name, "
+            "GROUP_CONCAT(di.product_name || ' ' || di.quantity || di.unit, ', ') AS items_summary "
+            "FROM delivery_txns dt "
+            "JOIN shops s ON s.id=dt.shop_id "
+            "JOIN customers c ON c.id=dt.customer_id "
+            "JOIN riders r ON r.id=dt.rider_id "
+            "LEFT JOIN delivery_items di ON di.transaction_id=dt.id "
+            "WHERE dt.delivery_date=? GROUP BY dt.id ORDER BY dt.timestamp DESC",
+            (today,)
+        ).fetchall()
+        conn.close()
+        if rows:
+            rows = [dict(r) for r in rows]
+            for r in rows:
+                r["timestamp"] = format_ts(r["timestamp"])
+            df = pd.DataFrame(rows)[["shop_name", "timestamp", "rider_name", "customer_name", "items_summary", "total_amount", "status"]]
+            df.columns = ["شاپ", "وقت", "رائیڈر", "کسٹمر", "پروڈکٹس", "رقم", "اسٹیٹس"]
+            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.metric("تمام شاپس کی آج کل ڈیلیوریز", len(rows))
+        else:
+            st.caption("آج ابھی تک کوئی ڈیلیوری نہیں ہوئی۔")
+
+        st.divider()
+        st.subheader("فی شاپ خلاصہ")
+        conn = get_conn()
+        shop_counts = conn.execute(
+            "SELECT s.name AS شاپ, "
+            "(SELECT COUNT(*) FROM customers WHERE shop_id=s.id) AS کسٹمرز, "
+            "(SELECT COUNT(*) FROM riders WHERE shop_id=s.id) AS رائیڈرز, "
+            "(SELECT COUNT(*) FROM products WHERE shop_id=s.id) AS پروڈکٹس "
+            "FROM shops s"
+        ).fetchall()
+        conn.close()
+        if shop_counts:
+            st.dataframe(pd.DataFrame([dict(r) for r in shop_counts]), use_container_width=True, hide_index=True)
+
+
 # ----------------------------- MAIN -----------------------------
-
-def apply_theme():
-    """Fully self-contained modern theme via CSS — works even without
-    .streamlit/config.toml, so no extra file/deployment step is needed."""
-    st.markdown("""
-    <style>
-        @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap');
-
-        html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"] {
-            background-color: #FFFFFF !important;
-            color: #1F2A37 !important;
-            font-family: 'Poppins', sans-serif !important;
-        }
-        [data-testid="stHeader"] { background-color: #FFFFFF !important; }
-        [data-testid="stSidebar"] {
-            background-color: #F1F3F5 !important;
-        }
-
-        /* branded gradient banner */
-        .naba-banner {
-            background: linear-gradient(90deg, #2F5A8A 0%, #3B6EA5 60%, #5B8FC4 100%);
-            padding: 18px 24px;
-            border-radius: 14px;
-            margin-bottom: 18px;
-            box-shadow: 0 4px 14px rgba(59,110,165,0.25);
-        }
-        .naba-banner h1 {
-            color: #FFFFFF !important;
-            margin: 0;
-            font-size: 26px;
-            font-weight: 700;
-        }
-        .naba-banner p {
-            color: #E8F0FA !important;
-            margin: 2px 0 0 0;
-            font-size: 13px;
-        }
-
-        /* cards */
-        [data-testid="stMetric"] {
-            background-color: #F8F9FB !important;
-            padding: 14px !important;
-            border-radius: 14px !important;
-            border: 1px solid #E6E9EE !important;
-            box-shadow: 0 2px 6px rgba(31,42,55,0.05);
-        }
-        [data-testid="stMetricLabel"] { color: #6B7280 !important; }
-        [data-testid="stMetricValue"] { color: #1F2A37 !important; font-weight: 600; }
-        [data-testid="stExpander"] {
-            border-radius: 12px !important;
-            border: 1px solid #E6E9EE !important;
-            box-shadow: 0 2px 6px rgba(31,42,55,0.04);
-        }
-
-        h1, h2, h3, h4, h5 { color: #1F2A37; font-weight: 600; }
-
-        /* inputs */
-        input, textarea, [data-baseweb="select"] > div {
-            border-radius: 10px !important;
-        }
-
-        /* buttons */
-        .stButton > button {
-            border-radius: 10px !important;
-            border-color: #3B6EA5 !important;
-            color: #3B6EA5 !important;
-            font-weight: 500;
-            transition: all 0.15s ease-in-out;
-        }
-        .stButton > button:hover {
-            background-color: #EAF1F8 !important;
-            transform: translateY(-1px);
-        }
-        .stButton > button[kind="primary"] {
-            background-color: #3B6EA5 !important;
-            border-color: #3B6EA5 !important;
-            color: #FFFFFF !important;
-            box-shadow: 0 3px 8px rgba(59,110,165,0.3);
-        }
-        .stButton > button[kind="primary"]:hover {
-            background-color: #2F5A8A !important;
-        }
-
-        /* tabs */
-        [data-testid="stTabs"] button[aria-selected="true"] {
-            color: #3B6EA5 !important;
-            border-bottom-color: #3B6EA5 !important;
-            font-weight: 600;
-        }
-        [data-baseweb="tab-highlight"] { background-color: #3B6EA5 !important; }
-        [data-baseweb="tab-list"] { border-bottom-color: #E2E5E9 !important; }
-
-        a, a:visited { color: #3B6EA5 !important; }
-        :root, .stApp { --primary-color: #3B6EA5; }
-    </style>
-    """, unsafe_allow_html=True)
-
-
-def render_banner():
-    st.markdown("""
-    <div class="naba-banner">
-        <h1>🥛 Doodh Delivery System</h1>
-        <p>NABA TECH BY KALEEM ULLAH SHARIF</p>
-    </div>
-    """, unsafe_allow_html=True)
-
 
 def main():
     st.set_page_config(page_title="Doodh Delivery System", page_icon="🥛", layout="wide")
-    apply_theme()
     init_db()
 
     if "user" not in st.session_state:
+        apply_theme()
         render_banner()
         login_page()
         return
 
-    render_banner()
-    logout_button()
     user = st.session_state.user
 
-    if user["role"] == "admin":
-        admin_panel(user)
-    elif user["role"] == "rider":
-        rider_panel(user)
-    elif user["role"] == "customer":
-        customer_panel(user)
+    if user["role"] == "master_admin":
+        apply_theme()
+        render_banner()
+        logout_button()
+        master_admin_panel(user)
+    else:
+        shop = get_shop(user["shop_id"])
+        apply_theme(shop)
+        render_banner(shop)
+        logout_button()
+
+        allowed, _ = check_shop_access(user["shop_id"])
+        if not allowed:
+            license_lock_screen(user)
+        elif user["role"] == "admin":
+            admin_panel(user)
+        elif user["role"] == "rider":
+            rider_panel(user)
+        elif user["role"] == "customer":
+            customer_panel(user)
 
     st.markdown("---")
     st.caption("NABA TECH BY KALEEM ULLAH SHARIF")
