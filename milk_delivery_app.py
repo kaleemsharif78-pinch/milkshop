@@ -569,8 +569,6 @@ def reset_user_password(user_id, new_password):
 
 
 def login_page():
-    st.markdown("## 🥛 Doodh Delivery System")
-    st.caption("NABA TECH BY KALEEM ULLAH SHARIF")
     with st.form("login_form"):
         username = st.text_input("Username")
         password = st.text_input("Password", type="password")
@@ -1122,22 +1120,32 @@ def admin_panel(user):
             target = login_users[sel]
 
             mode = st.radio("نیا پاسورڈ", ["خود لکھیں", "رینڈم جنریٹ کریں"], horizontal=True)
+            new_pw = None
+            confirm_ok = True
+
             if mode == "خود لکھیں":
-                new_pw = st.text_input("نیا پاسورڈ", value="123456")
+                new_pw = st.text_input("نیا پاسورڈ (کم از کم 4 حروف)", value="123456")
+                confirm_pw = st.text_input("پاسورڈ دوبارہ لکھیں (تصدیق)", value="123456")
+                if new_pw != confirm_pw:
+                    st.warning("دونوں پاسورڈ ایک جیسے نہیں ہیں۔")
+                    confirm_ok = False
+                elif len(new_pw) < 4:
+                    st.warning("پاسورڈ کم از کم 4 حروف کا ہونا چاہیے۔")
+                    confirm_ok = False
             else:
-                new_pw = None
                 if st.button("🎲 رینڈم پاسورڈ بنائیں"):
                     st.session_state["_gen_pw"] = random_password()
                 new_pw = st.session_state.get("_gen_pw")
                 if new_pw:
-                    st.info(f"جنریٹ شدہ پاسورڈ: **{new_pw}**")
+                    st.text_input("جنریٹ شدہ پاسورڈ (کاپی کے لیے)", value=new_pw, disabled=True, key="_gen_pw_display")
 
-            if st.button("✅ پاسورڈ ری سیٹ کریں", type="primary"):
+            if st.button("✅ پاسورڈ ری سیٹ کریں", type="primary", disabled=not confirm_ok):
                 if not new_pw:
                     st.error("پہلے نیا پاسورڈ لکھیں یا جنریٹ کریں۔")
                 else:
                     reset_user_password(target["id"], new_pw)
-                    st.success(f"{target['name']} (@{target['username']}) کا پاسورڈ ری سیٹ ہو گیا۔ نیا پاسورڈ یوزر کو بتا دیں: **{new_pw}**")
+                    st.success(f"{target['name']} (@{target['username']}) کا پاسورڈ ری سیٹ ہو گیا۔ نیا پاسورڈ یوزر کو بتا دیں:")
+                    st.code(new_pw, language=None)
                     st.session_state.pop("_gen_pw", None)
         else:
             st.caption("ابھی کوئی رائیڈر/کسٹمر لاگ ان اکاؤنٹ موجود نہیں۔")
@@ -1234,50 +1242,108 @@ def customer_panel(user):
 # ----------------------------- MAIN -----------------------------
 
 def apply_theme():
-    """Inline CSS fallback — applies even if .streamlit/config.toml isn't picked up
-    (wrong working directory, Streamlit Cloud path issue, or a manually-overridden
-    browser theme). Uses !important so it wins regardless of theme source."""
+    """Fully self-contained modern theme via CSS — works even without
+    .streamlit/config.toml, so no extra file/deployment step is needed."""
     st.markdown("""
     <style>
+        @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap');
+
         html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"] {
             background-color: #FFFFFF !important;
             color: #1F2A37 !important;
+            font-family: 'Poppins', sans-serif !important;
         }
         [data-testid="stHeader"] { background-color: #FFFFFF !important; }
         [data-testid="stSidebar"] {
             background-color: #F1F3F5 !important;
         }
-        [data-testid="stMetric"] {
-            background-color: #F1F3F5 !important;
-            padding: 12px;
-            border-radius: 10px;
-            border: 1px solid #E2E5E9;
+
+        /* branded gradient banner */
+        .naba-banner {
+            background: linear-gradient(90deg, #2F5A8A 0%, #3B6EA5 60%, #5B8FC4 100%);
+            padding: 18px 24px;
+            border-radius: 14px;
+            margin-bottom: 18px;
+            box-shadow: 0 4px 14px rgba(59,110,165,0.25);
         }
-        [data-testid="stMetricLabel"] { color: #4B5563 !important; }
-        [data-testid="stMetricValue"] { color: #1F2A37 !important; }
-        h1, h2, h3, h4, h5, p, span, label, div { color: #1F2A37; }
+        .naba-banner h1 {
+            color: #FFFFFF !important;
+            margin: 0;
+            font-size: 26px;
+            font-weight: 700;
+        }
+        .naba-banner p {
+            color: #E8F0FA !important;
+            margin: 2px 0 0 0;
+            font-size: 13px;
+        }
+
+        /* cards */
+        [data-testid="stMetric"] {
+            background-color: #F8F9FB !important;
+            padding: 14px !important;
+            border-radius: 14px !important;
+            border: 1px solid #E6E9EE !important;
+            box-shadow: 0 2px 6px rgba(31,42,55,0.05);
+        }
+        [data-testid="stMetricLabel"] { color: #6B7280 !important; }
+        [data-testid="stMetricValue"] { color: #1F2A37 !important; font-weight: 600; }
+        [data-testid="stExpander"] {
+            border-radius: 12px !important;
+            border: 1px solid #E6E9EE !important;
+            box-shadow: 0 2px 6px rgba(31,42,55,0.04);
+        }
+
+        h1, h2, h3, h4, h5 { color: #1F2A37; font-weight: 600; }
+
+        /* inputs */
+        input, textarea, [data-baseweb="select"] > div {
+            border-radius: 10px !important;
+        }
+
+        /* buttons */
         .stButton > button {
+            border-radius: 10px !important;
             border-color: #3B6EA5 !important;
             color: #3B6EA5 !important;
+            font-weight: 500;
+            transition: all 0.15s ease-in-out;
+        }
+        .stButton > button:hover {
+            background-color: #EAF1F8 !important;
+            transform: translateY(-1px);
         }
         .stButton > button[kind="primary"] {
             background-color: #3B6EA5 !important;
             border-color: #3B6EA5 !important;
             color: #FFFFFF !important;
+            box-shadow: 0 3px 8px rgba(59,110,165,0.3);
         }
+        .stButton > button[kind="primary"]:hover {
+            background-color: #2F5A8A !important;
+        }
+
+        /* tabs */
         [data-testid="stTabs"] button[aria-selected="true"] {
             color: #3B6EA5 !important;
             border-bottom-color: #3B6EA5 !important;
+            font-weight: 600;
         }
-        [data-baseweb="tab-highlight"] {
-            background-color: #3B6EA5 !important;
-        }
+        [data-baseweb="tab-highlight"] { background-color: #3B6EA5 !important; }
         [data-baseweb="tab-list"] { border-bottom-color: #E2E5E9 !important; }
+
         a, a:visited { color: #3B6EA5 !important; }
-        :root, .stApp {
-            --primary-color: #3B6EA5;
-        }
+        :root, .stApp { --primary-color: #3B6EA5; }
     </style>
+    """, unsafe_allow_html=True)
+
+
+def render_banner():
+    st.markdown("""
+    <div class="naba-banner">
+        <h1>🥛 Doodh Delivery System</h1>
+        <p>NABA TECH BY KALEEM ULLAH SHARIF</p>
+    </div>
     """, unsafe_allow_html=True)
 
 
@@ -1287,9 +1353,11 @@ def main():
     init_db()
 
     if "user" not in st.session_state:
+        render_banner()
         login_page()
         return
 
+    render_banner()
     logout_button()
     user = st.session_state.user
 
