@@ -33,6 +33,7 @@ from datetime import datetime, date, timedelta
 import hashlib
 import io
 import os
+import re
 import secrets
 import string
 import pandas as pd
@@ -990,6 +991,23 @@ def _ensure_urdu_fonts():
         _URDU_FONTS_REGISTERED = False
 
 
+_ARABIC_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F]")
+
+
+def has_arabic(text):
+    return bool(_ARABIC_RE.search(text or ""))
+
+
+def pick_font(text, heading=False):
+    """Only route text through the Urdu fonts when it actually contains
+    Arabic/Urdu characters. Nastaliq in particular has unusually tall line
+    metrics — using it for pure-Latin strings (like an English shop name)
+    caused headings to visually overlap the line below them."""
+    if has_arabic(text) and _URDU_FONTS_REGISTERED:
+        return "UrduHeading" if heading else "UrduBody"
+    return "Helvetica-Bold" if heading else "Helvetica"
+
+
 def ur(text):
     """Reshape + bidi-reorder Urdu/Arabic text for correct RTL rendering in
     reportlab. Safe no-op on pure Latin/numeric text (Rs amounts, dates)."""
@@ -1004,21 +1022,24 @@ def ur(text):
 
 def _pdf_header(elements, shop, title):
     _ensure_urdu_fonts()
-    heading_font = "UrduHeading" if _URDU_FONTS_REGISTERED else "Helvetica-Bold"
-    body_font = "UrduBody" if _URDU_FONTS_REGISTERED else "Helvetica"
     primary = (shop.get("primary_color") if shop else None) or "#3B6EA5"
-
-    title_style = ParagraphStyle("TitleUr", fontName=heading_font, fontSize=20, alignment=2, textColor=colors.HexColor(primary))
-    sub_style = ParagraphStyle("SubUr", fontName=body_font, fontSize=10, alignment=2, textColor=colors.HexColor("#4B5563"))
-    h2_style = ParagraphStyle("H2Ur", fontName=heading_font, fontSize=15, alignment=2, textColor=colors.HexColor("#1F2A37"))
-
     logo_text = (shop.get("logo_text") if shop else None) or "Doodh Delivery System"
+
+    title_font = pick_font(logo_text, heading=True)
+    title_style = ParagraphStyle("TitleUr", fontName=title_font, fontSize=20, leading=32, alignment=2, textColor=colors.HexColor(primary))
+    sub_style = ParagraphStyle("SubUr", fontName="Helvetica", fontSize=10, leading=14, alignment=2, textColor=colors.HexColor("#4B5563"))
+    h2_font = pick_font(title, heading=True)
+    h2_style = ParagraphStyle("H2Ur", fontName=h2_font, fontSize=15, leading=26, alignment=2, textColor=colors.HexColor("#1F2A37"))
+
+    default_body_font = "UrduBody" if _URDU_FONTS_REGISTERED else "Helvetica"
+
     elements.append(Paragraph(ur(logo_text), title_style))
+    elements.append(Spacer(1, 6))
     elements.append(Paragraph(ur("NABA TECH BY KALEEM ULLAH SHARIF"), sub_style))
-    elements.append(Spacer(1, 10))
+    elements.append(Spacer(1, 16))
     elements.append(Paragraph(ur(title), h2_style))
-    elements.append(Spacer(1, 8))
-    return heading_font, body_font
+    elements.append(Spacer(1, 10))
+    return default_body_font
 
 
 def generate_invoice_pdf(shop, customer, month, transactions, total_bill, total_paid, balance):
@@ -1026,9 +1047,9 @@ def generate_invoice_pdf(shop, customer, month, transactions, total_bill, total_
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=24 * mm, bottomMargin=20 * mm, leftMargin=18 * mm, rightMargin=18 * mm)
     elements = []
-    heading_font, body_font = _pdf_header(elements, shop, f"ماہانہ انوائس — {month}")
+    body_font = _pdf_header(elements, shop, f"ماہانہ انوائس — {month}")
 
-    info_style = ParagraphStyle("InfoUr", fontName=body_font, fontSize=11, alignment=2, textColor=colors.HexColor("#1F2A37"))
+    info_style = ParagraphStyle("InfoUr", fontName=body_font, fontSize=11, leading=17, alignment=2, textColor=colors.HexColor("#1F2A37"))
     elements.append(Paragraph(ur(f"کسٹمر: {customer['name']}"), info_style))
     if customer.get("address"):
         elements.append(Paragraph(ur(f"پتہ: {customer['address']}"), info_style))
@@ -1053,10 +1074,12 @@ def generate_invoice_pdf(shop, customer, month, transactions, total_bill, total_
     elements.append(table)
     elements.append(Spacer(1, 16))
 
-    total_style = ParagraphStyle("TotalUr", fontName=body_font, fontSize=12, alignment=2, textColor=colors.HexColor("#1F2A37"))
-    bold_style = ParagraphStyle("BoldUr", fontName=heading_font, fontSize=14, alignment=2, textColor=colors.HexColor("#1F2A37"))
+    total_style = ParagraphStyle("TotalUr", fontName=pick_font("کل بل"), fontSize=12, leading=18, alignment=2, textColor=colors.HexColor("#1F2A37"))
+    bold_style = ParagraphStyle("BoldUr", fontName=pick_font("باقی بقیہ", heading=True), fontSize=14, leading=24, alignment=2, textColor=colors.HexColor("#1F2A37"))
     elements.append(Paragraph(ur(f"کل بل: Rs {total_bill:.0f}"), total_style))
+    elements.append(Spacer(1, 4))
     elements.append(Paragraph(ur(f"وصول شدہ: Rs {total_paid:.0f}"), total_style))
+    elements.append(Spacer(1, 8))
     elements.append(Paragraph(ur(f"باقی بقیہ: Rs {balance:.0f}"), bold_style))
 
     doc.build(elements)
@@ -1069,9 +1092,9 @@ def generate_extra_order_receipt_pdf(shop, customer, order, items):
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=24 * mm, bottomMargin=20 * mm, leftMargin=18 * mm, rightMargin=18 * mm)
     elements = []
-    heading_font, body_font = _pdf_header(elements, shop, "اضافی آرڈر کی رسید")
+    body_font = _pdf_header(elements, shop, "اضافی آرڈر کی رسید")
 
-    info_style = ParagraphStyle("InfoUr2", fontName=body_font, fontSize=11, alignment=2, textColor=colors.HexColor("#1F2A37"))
+    info_style = ParagraphStyle("InfoUr2", fontName=body_font, fontSize=11, leading=17, alignment=2, textColor=colors.HexColor("#1F2A37"))
     elements.append(Paragraph(ur(f"کسٹمر: {customer['name']}"), info_style))
     elements.append(Paragraph(ur(f"آرڈر نمبر: #{order['id']}"), info_style))
     elements.append(Paragraph(ur(f"تاریخ: {format_ts(order['timestamp'])}"), info_style))
@@ -1092,7 +1115,7 @@ def generate_extra_order_receipt_pdf(shop, customer, order, items):
     ]))
     elements.append(table)
     elements.append(Spacer(1, 14))
-    bold_style = ParagraphStyle("BoldUr2", fontName=heading_font, fontSize=14, alignment=2, textColor=colors.HexColor("#1F2A37"))
+    bold_style = ParagraphStyle("BoldUr2", fontName=pick_font("کل رقم", heading=True), fontSize=14, leading=24, alignment=2, textColor=colors.HexColor("#1F2A37"))
     elements.append(Paragraph(ur(f"کل رقم: Rs {order['total_amount']:.0f}"), bold_style))
 
     doc.build(elements)
@@ -1105,7 +1128,7 @@ def generate_delivery_summary_pdf(shop, rows, period_label):
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=24 * mm, bottomMargin=20 * mm, leftMargin=18 * mm, rightMargin=18 * mm)
     elements = []
-    heading_font, body_font = _pdf_header(elements, shop, f"ڈیلیوری سمری — {period_label}")
+    body_font = _pdf_header(elements, shop, f"ڈیلیوری سمری — {period_label}")
 
     data = [[ur("اسٹیٹس"), "رقم", ur("پروڈکٹس"), ur("رائیڈر"), ur("کسٹمر"), ur("وقت")]]
     total = 0
@@ -1128,7 +1151,7 @@ def generate_delivery_summary_pdf(shop, rows, period_label):
     ]))
     elements.append(table)
     elements.append(Spacer(1, 14))
-    bold_style = ParagraphStyle("BoldUr3", fontName=heading_font, fontSize=13, alignment=2, textColor=colors.HexColor("#1F2A37"))
+    bold_style = ParagraphStyle("BoldUr3", fontName=pick_font("کل ڈیلیوریز", heading=True), fontSize=13, leading=22, alignment=2, textColor=colors.HexColor("#1F2A37"))
     elements.append(Paragraph(ur(f"کل ڈیلیوریز: {len(rows)}   |   کل رقم: Rs {total:.0f}"), bold_style))
 
     doc.build(elements)
