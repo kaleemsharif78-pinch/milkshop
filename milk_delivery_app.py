@@ -32,9 +32,24 @@ import sqlite3
 from datetime import datetime, date, timedelta
 import hashlib
 import io
+import os
 import secrets
 import string
 import pandas as pd
+
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.units import mm
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    import arabic_reshaper
+    from bidi.algorithm import get_display
+    PDF_AVAILABLE = True
+except ImportError:
+    PDF_AVAILABLE = False
 
 try:
     import qrcode
@@ -273,6 +288,33 @@ def init_db():
         )
     """)
     _add_column_if_missing(conn, "notifications", "shop_id INTEGER")
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS extra_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            shop_id INTEGER NOT NULL,
+            customer_id INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','fulfilled','cancelled')),
+            total_amount REAL NOT NULL DEFAULT 0,
+            order_date TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            fulfilled_delivery_id INTEGER
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS extra_order_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER NOT NULL,
+            product_id INTEGER,
+            product_name TEXT NOT NULL,
+            unit TEXT NOT NULL,
+            quantity REAL NOT NULL,
+            rate REAL NOT NULL,
+            amount REAL NOT NULL,
+            FOREIGN KEY(order_id) REFERENCES extra_orders(id)
+        )
+    """)
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS settings (
@@ -670,6 +712,73 @@ def get_transactions(shop_id, customer_id=None, rider_id=None, date_filter=None,
     return [dict(r) for r in rows]
 
 
+# ----------------------------- EXTRA ORDERS (customer self-service catalog) -----------------------------
+
+def place_extra_order(shop_id, customer_id, cart_items):
+    """Customer submits an ad-hoc order for extra items (beyond the daily milk
+    subscription). Notifies both the customer (confirmation) and admin/rider
+    (so the rider brings the right items on the next delivery)."""
+    total_amount = round(sum(it["qty"] * it["rate"] for it in cart_items), 2)
+    conn = get_conn()
+    cur = conn.execute(
+        "INSERT INTO extra_orders (shop_id,customer_id,status,total_amount,order_date,timestamp) VALUES (?,?,?,?,?,?)",
+        (shop_id, customer_id, "pending", total_amount, date.today().isoformat(), datetime.now().isoformat())
+    )
+    order_id = cur.lastrowid
+    for it in cart_items:
+        amount = round(it["qty"] * it["rate"], 2)
+        conn.execute(
+            "INSERT INTO extra_order_items (order_id,product_id,product_name,unit,quantity,rate,amount) VALUES (?,?,?,?,?,?,?)",
+            (order_id, it.get("product_id"), it["product_name"], it["unit"], it["qty"], it["rate"], amount)
+        )
+    conn.commit()
+    conn.close()
+
+    summary = items_summary_text(cart_items)
+    push_notification(customer_id, f"آپ کا اضافی آرڈر جمع ہو گیا — {summary} / Rs {total_amount:.0f}", shop_id, audience="customer")
+    push_notification(customer_id, f"نیا اضافی آرڈر موصول ہوا — {summary} / Rs {total_amount:.0f}", shop_id, audience="admin")
+    return order_id
+
+
+def get_extra_orders(shop_id, customer_id=None, status=None):
+    q = (
+        "SELECT eo.*, c.name AS customer_name, "
+        "GROUP_CONCAT(eoi.product_name || ' ' || eoi.quantity || eoi.unit, ', ') AS items_summary "
+        "FROM extra_orders eo JOIN customers c ON c.id=eo.customer_id "
+        "LEFT JOIN extra_order_items eoi ON eoi.order_id=eo.id "
+        "WHERE eo.shop_id=?"
+    )
+    params = [shop_id]
+    if customer_id:
+        q += " AND eo.customer_id=?"
+        params.append(customer_id)
+    if status:
+        q += " AND eo.status=?"
+        params.append(status)
+    q += " GROUP BY eo.id ORDER BY eo.timestamp DESC"
+    conn = get_conn()
+    rows = conn.execute(q, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_extra_order_items(order_id):
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM extra_order_items WHERE order_id=?", (order_id,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def fulfill_extra_order(order_id, delivery_txn_id):
+    conn = get_conn()
+    conn.execute(
+        "UPDATE extra_orders SET status='fulfilled', fulfilled_delivery_id=? WHERE id=?",
+        (delivery_txn_id, order_id)
+    )
+    conn.commit()
+    conn.close()
+
+
 # ----------------------------- AUTH -----------------------------
 
 def authenticate(username, password):
@@ -860,6 +969,173 @@ def license_lock_screen(user):
         st.info("براہ کرم اپنی شاپ کے ایڈمن سے رابطہ کریں تاکہ لائسنس رینیو ہو سکے۔")
 
 
+# ----------------------------- PDF GENERATION -----------------------------
+
+_FONTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+_URDU_FONTS_REGISTERED = False
+
+
+def _ensure_urdu_fonts():
+    """Registers bundled Urdu-capable TTF fonts once. Falls back to
+    Helvetica (no Urdu glyphs) if the fonts folder isn't shipped alongside
+    the script or reportlab/font libs aren't installed."""
+    global _URDU_FONTS_REGISTERED
+    if not PDF_AVAILABLE or _URDU_FONTS_REGISTERED:
+        return
+    try:
+        pdfmetrics.registerFont(TTFont("UrduHeading", os.path.join(_FONTS_DIR, "NotoNastaliqUrdu.ttf")))
+        pdfmetrics.registerFont(TTFont("UrduBody", os.path.join(_FONTS_DIR, "NotoNaskhArabic.ttf")))
+        _URDU_FONTS_REGISTERED = True
+    except Exception:
+        _URDU_FONTS_REGISTERED = False
+
+
+def ur(text):
+    """Reshape + bidi-reorder Urdu/Arabic text for correct RTL rendering in
+    reportlab. Safe no-op on pure Latin/numeric text (Rs amounts, dates)."""
+    if text is None:
+        return ""
+    text = str(text)
+    try:
+        return get_display(arabic_reshaper.reshape(text))
+    except Exception:
+        return text
+
+
+def _pdf_header(elements, shop, title):
+    _ensure_urdu_fonts()
+    heading_font = "UrduHeading" if _URDU_FONTS_REGISTERED else "Helvetica-Bold"
+    body_font = "UrduBody" if _URDU_FONTS_REGISTERED else "Helvetica"
+    primary = (shop.get("primary_color") if shop else None) or "#3B6EA5"
+
+    title_style = ParagraphStyle("TitleUr", fontName=heading_font, fontSize=20, alignment=2, textColor=colors.HexColor(primary))
+    sub_style = ParagraphStyle("SubUr", fontName=body_font, fontSize=10, alignment=2, textColor=colors.HexColor("#4B5563"))
+    h2_style = ParagraphStyle("H2Ur", fontName=heading_font, fontSize=15, alignment=2, textColor=colors.HexColor("#1F2A37"))
+
+    logo_text = (shop.get("logo_text") if shop else None) or "Doodh Delivery System"
+    elements.append(Paragraph(ur(logo_text), title_style))
+    elements.append(Paragraph(ur("NABA TECH BY KALEEM ULLAH SHARIF"), sub_style))
+    elements.append(Spacer(1, 10))
+    elements.append(Paragraph(ur(title), h2_style))
+    elements.append(Spacer(1, 8))
+    return heading_font, body_font
+
+
+def generate_invoice_pdf(shop, customer, month, transactions, total_bill, total_paid, balance):
+    """Monthly invoice / bill PDF for a customer."""
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=24 * mm, bottomMargin=20 * mm, leftMargin=18 * mm, rightMargin=18 * mm)
+    elements = []
+    heading_font, body_font = _pdf_header(elements, shop, f"ماہانہ انوائس — {month}")
+
+    info_style = ParagraphStyle("InfoUr", fontName=body_font, fontSize=11, alignment=2, textColor=colors.HexColor("#1F2A37"))
+    elements.append(Paragraph(ur(f"کسٹمر: {customer['name']}"), info_style))
+    if customer.get("address"):
+        elements.append(Paragraph(ur(f"پتہ: {customer['address']}"), info_style))
+    if customer.get("phone"):
+        elements.append(Paragraph(ur(f"فون: {customer['phone']}"), info_style))
+    elements.append(Spacer(1, 12))
+
+    data = [[ur("اسٹیٹس"), "رقم", ur("پروڈکٹس"), ur("تاریخ/وقت")]]
+    for r in transactions:
+        data.append([ur(r["status"]), f"Rs {r['total_amount']:.0f}", ur(r["items_summary"] or "—"), ur(format_ts(r["timestamp"]))])
+    table = Table(data, colWidths=[25 * mm, 25 * mm, 60 * mm, 45 * mm])
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor((shop.get("primary_color") if shop else None) or "#3B6EA5")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, -1), body_font),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("ALIGN", (0, 0), (-1, -1), "RIGHT"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F8F9FB")]),
+    ]))
+    elements.append(table)
+    elements.append(Spacer(1, 16))
+
+    total_style = ParagraphStyle("TotalUr", fontName=body_font, fontSize=12, alignment=2, textColor=colors.HexColor("#1F2A37"))
+    bold_style = ParagraphStyle("BoldUr", fontName=heading_font, fontSize=14, alignment=2, textColor=colors.HexColor("#1F2A37"))
+    elements.append(Paragraph(ur(f"کل بل: Rs {total_bill:.0f}"), total_style))
+    elements.append(Paragraph(ur(f"وصول شدہ: Rs {total_paid:.0f}"), total_style))
+    elements.append(Paragraph(ur(f"باقی بقیہ: Rs {balance:.0f}"), bold_style))
+
+    doc.build(elements)
+    buf.seek(0)
+    return buf
+
+
+def generate_extra_order_receipt_pdf(shop, customer, order, items):
+    """Receipt PDF for a single extra (ad-hoc) order."""
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=24 * mm, bottomMargin=20 * mm, leftMargin=18 * mm, rightMargin=18 * mm)
+    elements = []
+    heading_font, body_font = _pdf_header(elements, shop, "اضافی آرڈر کی رسید")
+
+    info_style = ParagraphStyle("InfoUr2", fontName=body_font, fontSize=11, alignment=2, textColor=colors.HexColor("#1F2A37"))
+    elements.append(Paragraph(ur(f"کسٹمر: {customer['name']}"), info_style))
+    elements.append(Paragraph(ur(f"آرڈر نمبر: #{order['id']}"), info_style))
+    elements.append(Paragraph(ur(f"تاریخ: {format_ts(order['timestamp'])}"), info_style))
+    elements.append(Paragraph(ur(f"اسٹیٹس: {order['status']}"), info_style))
+    elements.append(Spacer(1, 12))
+
+    data = [["رقم", "ریٹ", ur("مقدار"), ur("آئٹم")]]
+    for it in items:
+        data.append([f"Rs {it['amount']:.0f}", f"Rs {it['rate']:.0f}", f"{it['quantity']}{it['unit']}", ur(it["product_name"])])
+    table = Table(data, colWidths=[25 * mm, 25 * mm, 25 * mm, 80 * mm])
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor((shop.get("primary_color") if shop else None) or "#3B6EA5")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, -1), body_font),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("ALIGN", (0, 0), (-1, -1), "RIGHT"),
+    ]))
+    elements.append(table)
+    elements.append(Spacer(1, 14))
+    bold_style = ParagraphStyle("BoldUr2", fontName=heading_font, fontSize=14, alignment=2, textColor=colors.HexColor("#1F2A37"))
+    elements.append(Paragraph(ur(f"کل رقم: Rs {order['total_amount']:.0f}"), bold_style))
+
+    doc.build(elements)
+    buf.seek(0)
+    return buf
+
+
+def generate_delivery_summary_pdf(shop, rows, period_label):
+    """Daily/monthly delivery summary PDF (admin use) across all customers."""
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=24 * mm, bottomMargin=20 * mm, leftMargin=18 * mm, rightMargin=18 * mm)
+    elements = []
+    heading_font, body_font = _pdf_header(elements, shop, f"ڈیلیوری سمری — {period_label}")
+
+    data = [[ur("اسٹیٹس"), "رقم", ur("پروڈکٹس"), ur("رائیڈر"), ur("کسٹمر"), ur("وقت")]]
+    total = 0
+    for r in rows:
+        data.append([
+            ur(r["status"]), f"Rs {r['total_amount']:.0f}", ur(r.get("items_summary") or "—"),
+            ur(r.get("rider_name") or "—"), ur(r.get("customer_name") or "—"), ur(format_ts(r["timestamp"]))
+        ])
+        if r["status"] != "missed":
+            total += r["total_amount"]
+    table = Table(data, colWidths=[18 * mm, 20 * mm, 40 * mm, 25 * mm, 30 * mm, 38 * mm], repeatRows=1)
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor((shop.get("primary_color") if shop else None) or "#3B6EA5")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, -1), body_font),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("ALIGN", (0, 0), (-1, -1), "RIGHT"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F8F9FB")]),
+    ]))
+    elements.append(table)
+    elements.append(Spacer(1, 14))
+    bold_style = ParagraphStyle("BoldUr3", fontName=heading_font, fontSize=13, alignment=2, textColor=colors.HexColor("#1F2A37"))
+    elements.append(Paragraph(ur(f"کل ڈیلیوریز: {len(rows)}   |   کل رقم: Rs {total:.0f}"), bold_style))
+
+    doc.build(elements)
+    buf.seek(0)
+    return buf
+
+
 # ----------------------------- RIDER PANEL -----------------------------
 
 def rider_panel(user):
@@ -873,7 +1149,7 @@ def rider_panel(user):
     products = get_products(shop_id)
     milk = get_default_quota_product(shop_id)
 
-    for key, default in [("cart", []), ("selected_customer", None)]:
+    for key, default in [("cart", []), ("selected_customer", None), ("pending_order_ids", [])]:
         if key not in st.session_state:
             st.session_state[key] = default
 
@@ -899,6 +1175,7 @@ def rider_panel(user):
                         if not st.session_state.selected_customer or st.session_state.selected_customer["id"] != cust["id"]:
                             st.session_state.selected_customer = cust
                             st.session_state.cart = []
+                            st.session_state.pending_order_ids = []
                             if milk and cust["daily_quota_kg"] > 0:
                                 st.session_state.cart.append({
                                     "product_id": milk["id"], "product_name": milk["name"],
@@ -920,6 +1197,7 @@ def rider_panel(user):
                 cust = customers[idx]
                 st.session_state.selected_customer = cust
                 st.session_state.cart = []
+                st.session_state.pending_order_ids = []
                 if milk and cust["daily_quota_kg"] > 0:
                     st.session_state.cart.append({
                         "product_id": milk["id"], "product_name": milk["name"],
@@ -938,6 +1216,21 @@ def rider_panel(user):
             c2.metric("ایڈریس", cust["address"] or "—")
             c3.metric("ڈیفالٹ دودھ", f"{cust['daily_quota_kg']} kg")
             st.caption(f"بقیہ: Rs {customer_balance(cust['id']):.0f}")
+
+            pending_orders = get_extra_orders(shop_id, customer_id=cust["id"], status="pending")
+            if pending_orders:
+                st.warning(f"🛒 اس کسٹمر کے {len(pending_orders)} پینڈنگ اضافی آرڈر موجود ہیں")
+                for po in pending_orders:
+                    col_a, col_b = st.columns([3, 1])
+                    col_a.write(f"#{po['id']} — {po['items_summary'] or '—'} — Rs {po['total_amount']:.0f}")
+                    if col_b.button("➕ کارٹ میں شامل کریں", key=f"pull_order_{po['id']}"):
+                        for it in get_extra_order_items(po["id"]):
+                            st.session_state.cart.append({
+                                "product_id": it["product_id"], "product_name": it["product_name"],
+                                "unit": it["unit"], "qty": it["quantity"], "rate": it["rate"]
+                            })
+                        st.session_state.pending_order_ids.append(po["id"])
+                        st.rerun()
 
             st.subheader("3️⃣ پروڈکٹس شامل کریں")
             for p in products:
@@ -966,9 +1259,12 @@ def rider_panel(user):
 
                 st.subheader("4️⃣ کنفرم کریں")
                 if st.button("✅ Confirm Delivery", type="primary", use_container_width=True):
-                    confirm_delivery(cust["id"], rider["id"], st.session_state.cart, shop_id)
+                    txn_id = confirm_delivery(cust["id"], rider["id"], st.session_state.cart, shop_id)
+                    for order_id in st.session_state.pending_order_ids:
+                        fulfill_extra_order(order_id, txn_id)
                     st.session_state.cart = []
                     st.session_state.selected_customer = None
+                    st.session_state.pending_order_ids = []
                     st.success("✅ ڈیلیوری فوری سیو اور سنک ہو گئی — اونر ڈیش بورڈ اور کسٹمر پینل اپڈیٹ ہو گئے۔")
                     st.rerun()
             else:
@@ -979,6 +1275,7 @@ def rider_panel(user):
                 mark_missed(cust["id"], rider["id"], shop_id)
                 st.session_state.selected_customer = None
                 st.session_state.cart = []
+                st.session_state.pending_order_ids = []
                 st.success("ناغہ درج کر دیا گیا اور کسٹمر/اونر کو مطلع کر دیا گیا۔")
                 st.rerun()
         else:
@@ -1050,7 +1347,7 @@ def admin_panel(user):
         st.caption(f"{badge} — {shop['name']}" + (f" — میعاد: {format_ts(expiry)}" if expiry else ""))
 
     tabs = st.tabs([
-        "📡 لائیو ٹریکنگ", "🧀 پروڈکٹس / ریٹس", "👥 کسٹمرز", "🛵 رائیڈرز",
+        "📡 لائیو ٹریکنگ", "🛒 اضافی آرڈرز", "🧀 پروڈکٹس / ریٹس", "👥 کسٹمرز", "🛵 رائیڈرز",
         "📒 کھاتہ / لیجر", "💵 وصولی درج کریں", "🧾 کیش سیٹلمنٹ", "🔑 پاسورڈز", "🎨 برانڈنگ"
     ])
 
@@ -1076,8 +1373,22 @@ def admin_panel(user):
                 })
             st.dataframe(pd.DataFrame(display_rows), use_container_width=True, hide_index=True)
             st.metric("آج کل رقم", f"Rs {sum(r['total_amount'] for r in rows):.0f}")
+            if PDF_AVAILABLE:
+                summary_buf = generate_delivery_summary_pdf(shop, rows, today)
+                st.download_button("📄 آج کی سمری PDF ڈاؤن لوڈ کریں", data=summary_buf, file_name=f"delivery_summary_{today}.pdf", mime="application/pdf")
         else:
             st.caption("آج ابھی تک کوئی ڈیلیوری نہیں ہوئی۔")
+
+        if PDF_AVAILABLE:
+            st.divider()
+            st.subheader("📄 ماہانہ سمری (تمام کسٹمرز)")
+            month_for_summary = st.text_input("مہینہ (YYYY-MM)", value=date.today().strftime("%Y-%m"), key="live_month_summary")
+            month_rows = get_transactions(shop_id, month_filter=month_for_summary)
+            if month_rows:
+                monthly_all_buf = generate_delivery_summary_pdf(shop, month_rows, month_for_summary)
+                st.download_button("📄 ماہانہ سمری PDF ڈاؤن لوڈ کریں", data=monthly_all_buf, file_name=f"delivery_summary_{month_for_summary}.pdf", mime="application/pdf", key="monthly_all_dl")
+            else:
+                st.caption("اس مہینے کوئی ریکارڈ نہیں۔")
 
         st.divider()
         st.subheader("🔔 حالیہ نوٹیفکیشنز")
@@ -1088,8 +1399,44 @@ def admin_panel(user):
         else:
             st.caption("کوئی نوٹیفکیشن نہیں۔")
 
-    # ---- Products / Rates ----
+    # ---- Extra (ad-hoc) orders from customers ----
     with tabs[1]:
+        col_h2, col_r2 = st.columns([4, 1])
+        col_h2.subheader("🛒 کسٹمرز کے اضافی آرڈرز")
+        if col_r2.button("🔄 ریفریش", key="refresh_extra_orders"):
+            st.rerun()
+
+        pending_orders = get_extra_orders(shop_id, status="pending")
+        if pending_orders:
+            display_rows = [{
+                "وقت": format_ts(o["timestamp"]),
+                "کسٹمر": o["customer_name"],
+                "آئٹمز": o["items_summary"] or "—",
+                "رقم": o["total_amount"],
+            } for o in pending_orders]
+            st.dataframe(pd.DataFrame(display_rows), use_container_width=True, hide_index=True)
+            st.caption("یہ آرڈرز خودکار طور پر رائیڈر کو نظر آئیں گے جب وہ اس کسٹمر کو اسکین/منتخب کرے گا۔")
+        else:
+            st.caption("فی الحال کوئی پینڈنگ اضافی آرڈر نہیں۔")
+
+        st.divider()
+        st.subheader("مکمل شدہ / پرانے آرڈرز")
+        all_orders = get_extra_orders(shop_id)
+        fulfilled = [o for o in all_orders if o["status"] != "pending"]
+        if fulfilled:
+            display_rows = [{
+                "وقت": format_ts(o["timestamp"]),
+                "کسٹمر": o["customer_name"],
+                "آئٹمز": o["items_summary"] or "—",
+                "رقم": o["total_amount"],
+                "اسٹیٹس": o["status"],
+            } for o in fulfilled[:30]]
+            st.dataframe(pd.DataFrame(display_rows), use_container_width=True, hide_index=True)
+        else:
+            st.caption("ابھی کوئی مکمل شدہ آرڈر نہیں۔")
+
+    # ---- Products / Rates ----
+    with tabs[2]:
         st.subheader("نیا پروڈکٹ شامل کریں")
         with st.form("add_product"):
             p_name = st.text_input("پروڈکٹ کا نام (مثلاً پینیر، کھویا)")
@@ -1121,7 +1468,7 @@ def admin_panel(user):
                         st.rerun()
 
     # ---- Customers ----
-    with tabs[2]:
+    with tabs[3]:
         st.subheader("نیا کسٹمر شامل کریں")
         with st.form("add_customer"):
             c_name = st.text_input("نام")
@@ -1185,7 +1532,7 @@ def admin_panel(user):
             st.caption("ابھی کوئی کسٹمر شامل نہیں کیا گیا۔")
 
     # ---- Riders ----
-    with tabs[3]:
+    with tabs[4]:
         st.subheader("نیا رائیڈر شامل کریں")
         with st.form("add_rider"):
             r_name = st.text_input("نام", key="r_name")
@@ -1222,7 +1569,7 @@ def admin_panel(user):
             st.dataframe(pd.DataFrame([dict(r) for r in riders])[["name", "phone"]], hide_index=True, use_container_width=True)
 
     # ---- Ledger ----
-    with tabs[4]:
+    with tabs[5]:
         st.subheader("ماہانہ کھاتہ / لیجر")
         customers = get_customers(shop_id)
         if customers:
@@ -1259,11 +1606,18 @@ def admin_panel(user):
                     "اسٹیٹس": r["status"],
                 } for r in rows]
                 st.dataframe(pd.DataFrame(display_rows), use_container_width=True, hide_index=True)
+
+                if PDF_AVAILABLE:
+                    col_p1, col_p2 = st.columns(2)
+                    invoice_buf = generate_invoice_pdf(shop, cust, month, rows, total_bill, total_paid, customer_balance(cust["id"]))
+                    col_p1.download_button("📄 اس کسٹمر کا انوائس PDF", data=invoice_buf, file_name=f"invoice_{cust['name']}_{month}.pdf", mime="application/pdf", key="ledger_invoice_dl")
+                    monthly_summary_buf = generate_delivery_summary_pdf(shop, rows, month)
+                    col_p2.download_button("📄 اس کسٹمر کی ماہانہ سمری PDF", data=monthly_summary_buf, file_name=f"summary_{cust['name']}_{month}.pdf", mime="application/pdf", key="ledger_summary_dl")
         else:
             st.caption("پہلے کسٹمر شامل کریں۔")
 
     # ---- Record payment ----
-    with tabs[5]:
+    with tabs[6]:
         st.subheader("وصولی درج کریں")
         customers = get_customers(shop_id)
         if customers:
@@ -1291,7 +1645,7 @@ def admin_panel(user):
             st.caption("پہلے کسٹمر شامل کریں۔")
 
     # ---- Cash Settlement / Recovery ----
-    with tabs[6]:
+    with tabs[7]:
         st.subheader("🧾 رائیڈرز کی نقدی (Cash in Hand)")
         conn = get_conn()
         riders = [dict(r) for r in conn.execute("SELECT * FROM riders WHERE active=1 AND shop_id=?", (shop_id,)).fetchall()]
@@ -1345,7 +1699,7 @@ def admin_panel(user):
             st.caption("پہلے رائیڈر شامل کریں۔")
 
     # ---- Password reset ----
-    with tabs[7]:
+    with tabs[8]:
         st.subheader("🔑 کسی بھی یوزر کا پاسورڈ ری سیٹ کریں")
         conn = get_conn()
         login_users = conn.execute(
@@ -1392,7 +1746,7 @@ def admin_panel(user):
             st.caption("ابھی کوئی رائیڈر/کسٹمر لاگ ان اکاؤنٹ موجود نہیں۔")
 
     # ---- Branding (shop admin can tweak within their own shop) ----
-    with tabs[8]:
+    with tabs[9]:
         st.subheader("🎨 برانڈنگ")
         st.caption("یہ رنگ اور لوگو صرف آپ کی اپنی شاپ پر لاگو ہوں گے۔")
         if shop:
@@ -1448,6 +1802,60 @@ def customer_panel(user):
         else:
             st.caption(f"آپ کا شناختی کوڈ: `{cust['code']}`")
 
+    st.divider()
+    st.subheader("🛒 اضافی سامان کا آرڈر")
+    st.caption("دودھ کی باقاعدہ ڈیلیوری کے علاوہ کوئی اضافی چیز چاہیے تو یہاں سے منتخب کریں۔")
+
+    if "extra_cart" not in st.session_state:
+        st.session_state.extra_cart = []
+
+    extra_products = [p for p in get_products(shop_id) if not p["is_default_quota_item"]]
+    if extra_products:
+        for p in extra_products:
+            col1, col2, col3 = st.columns([3, 2, 1])
+            col1.write(f"**{p['name']}** — Rs {p['rate']:.0f}/{p['unit']}")
+            qty = col2.number_input("مقدار", min_value=0.0, value=0.0, step=0.25 if p["unit"] == "kg" else 1.0, key=f"extra_qty_{p['id']}", label_visibility="collapsed")
+            if col3.button("➕ شامل کریں", key=f"extra_add_{p['id']}"):
+                if qty > 0:
+                    st.session_state.extra_cart.append({
+                        "product_id": p["id"], "product_name": p["name"],
+                        "unit": p["unit"], "qty": qty, "rate": p["rate"]
+                    })
+                    st.rerun()
+                else:
+                    st.warning("پہلے مقدار درج کریں۔")
+
+        if st.session_state.extra_cart:
+            st.markdown("#### آپ کی موجودہ سلیکشن")
+            for i, it in enumerate(st.session_state.extra_cart):
+                cc1, cc2 = st.columns([4, 1])
+                cc1.write(f"{it['product_name']} — {it['qty']}{it['unit']} = Rs {it['qty']*it['rate']:.0f}")
+                if cc2.button("🗑️", key=f"extra_del_{i}"):
+                    st.session_state.extra_cart.pop(i)
+                    st.rerun()
+            running_total = sum(it["qty"] * it["rate"] for it in st.session_state.extra_cart)
+            st.markdown(f"**لائیو کل رقم: Rs {running_total:.0f}**")
+            if st.button("✅ آرڈر جمع کروائیں", type="primary"):
+                place_extra_order(shop_id, cust["id"], st.session_state.extra_cart)
+                st.session_state.extra_cart = []
+                st.success("آپ کا آرڈر جمع ہو گیا — رائیڈر اگلی ڈیلیوری پر یہ سامان لے آئے گا۔")
+                st.rerun()
+    else:
+        st.caption("فی الحال کوئی اضافی پروڈکٹ دستیاب نہیں۔")
+
+    my_orders = get_extra_orders(shop_id, customer_id=cust["id"])
+    if my_orders:
+        st.markdown("#### میرے اضافی آرڈرز")
+        shop_for_pdf = get_shop(shop_id)
+        for o in my_orders[:10]:
+            status_label = {"pending": "⏳ پینڈنگ", "fulfilled": "✅ مکمل", "cancelled": "❌ منسوخ"}.get(o["status"], o["status"])
+            col1, col2 = st.columns([4, 1])
+            col1.write(f"#{o['id']} — {format_ts(o['timestamp'])} — {o['items_summary'] or '—'} — Rs {o['total_amount']:.0f} — {status_label}")
+            if PDF_AVAILABLE:
+                items = get_extra_order_items(o["id"])
+                pdf_buf = generate_extra_order_receipt_pdf(shop_for_pdf, cust, o, items)
+                col2.download_button("📄 رسید", data=pdf_buf, file_name=f"receipt_{o['id']}.pdf", mime="application/pdf", key=f"receipt_dl_{o['id']}")
+
     month = date.today().strftime("%Y-%m")
     rows = get_transactions(shop_id, customer_id=cust["id"], month_filter=month)
     conn = get_conn()
@@ -1477,6 +1885,10 @@ def customer_panel(user):
             "اسٹیٹس": r["status"],
         } for r in rows]
         st.dataframe(pd.DataFrame(display_rows), use_container_width=True, hide_index=True)
+        if PDF_AVAILABLE:
+            shop_for_pdf = get_shop(shop_id)
+            invoice_buf = generate_invoice_pdf(shop_for_pdf, cust, month, rows, total_bill, total_paid, customer_balance(cust["id"]))
+            st.download_button("📄 ماہانہ انوائس PDF ڈاؤن لوڈ کریں", data=invoice_buf, file_name=f"invoice_{cust['name']}_{month}.pdf", mime="application/pdf")
     else:
         st.caption("اس مہینے ابھی تک کوئی ریکارڈ نہیں۔")
 
