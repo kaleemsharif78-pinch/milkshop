@@ -4,3 +4,6 @@ qrcode
 Pillow
 pyzbar
 cryptography
+reportlab
+arabic-reshaper
+python-bidi
