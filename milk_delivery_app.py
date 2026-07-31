@@ -988,18 +988,22 @@ def render_banner(shop=None):
     logo_html = f'<img class="naba-banner-logo-img" src="data:image/png;base64,{logo_img}" />' if logo_img else f'<span style="font-size:34px;">{emoji}</span>'
     proprietor_html = f'<p class="proprietor">{proprietor}</p>' if proprietor else ""
 
-    st.markdown(f"""
-    <div class="naba-banner">
-        <div class="naba-banner-row">
-            {logo_html}
-            <div>
-                <h1>{text}</h1>
-                {proprietor_html}
-            </div>
-        </div>
-        <p class="contact">NABA Tech | Mobile: 03151186003</p>
-    </div>
-    """, unsafe_allow_html=True)
+    # Built as ONE unbroken line (no newlines/indentation). Streamlit's
+    # st.markdown runs standard Markdown first: a blank line followed by
+    # indented text gets turned into a literal code block, which broke the
+    # HTML whenever proprietor_html was empty (leaving a blank line mid-block).
+    banner_html = (
+        '<div class="naba-banner">'
+        '<div class="naba-banner-row">'
+        f'{logo_html}'
+        '<div>'
+        f'<h1>{text}</h1>'
+        f'{proprietor_html}'
+        '</div></div>'
+        '<p class="contact">NABA Tech | Mobile: 03151186003</p>'
+        '</div>'
+    )
+    st.markdown(banner_html, unsafe_allow_html=True)
 
 
 def render_broadcasts():
