@@ -1020,6 +1020,21 @@ def ur(text):
         return text
 
 
+def _pcell(text, font_size=9, color="#1F2A37", bold=False):
+    """Build a table cell as a Paragraph (not a raw string) so long text
+    (like a joined product list) wraps onto multiple lines with proper
+    leading — raw strings in reportlab Tables can wrap without adding line
+    spacing, causing wrapped lines to visually overlap."""
+    text = "" if text is None else str(text)
+    font = pick_font(text, heading=bold)
+    style = ParagraphStyle(
+        f"Cell_{font}_{font_size}_{color}",
+        fontName=font, fontSize=font_size, leading=font_size * 1.6,
+        alignment=2, textColor=colors.HexColor(color),
+    )
+    return Paragraph(ur(text), style)
+
+
 def _pdf_header(elements, shop, title):
     _ensure_urdu_fonts()
     primary = (shop.get("primary_color") if shop else None) or "#3B6EA5"
@@ -1057,18 +1072,17 @@ def generate_invoice_pdf(shop, customer, month, transactions, total_bill, total_
         elements.append(Paragraph(ur(f"فون: {customer['phone']}"), info_style))
     elements.append(Spacer(1, 12))
 
-    data = [[ur("اسٹیٹس"), "رقم", ur("پروڈکٹس"), ur("تاریخ/وقت")]]
+    data = [[_pcell("اسٹیٹس", color="#FFFFFF"), _pcell("رقم", color="#FFFFFF"), _pcell("پروڈکٹس", color="#FFFFFF"), _pcell("تاریخ/وقت", color="#FFFFFF")]]
     for r in transactions:
-        data.append([ur(r["status"]), f"Rs {r['total_amount']:.0f}", ur(r["items_summary"] or "—"), ur(format_ts(r["timestamp"]))])
+        data.append([_pcell(r["status"]), _pcell(f"Rs {r['total_amount']:.0f}"), _pcell(r["items_summary"] or "—"), _pcell(format_ts(r["timestamp"]))])
     table = Table(data, colWidths=[25 * mm, 25 * mm, 60 * mm, 45 * mm])
     table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor((shop.get("primary_color") if shop else None) or "#3B6EA5")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONTNAME", (0, 0), (-1, -1), body_font),
-        ("FONTSIZE", (0, 0), (-1, -1), 9),
         ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
         ("ALIGN", (0, 0), (-1, -1), "RIGHT"),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
         ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F8F9FB")]),
     ]))
     elements.append(table)
@@ -1101,17 +1115,17 @@ def generate_extra_order_receipt_pdf(shop, customer, order, items):
     elements.append(Paragraph(ur(f"اسٹیٹس: {order['status']}"), info_style))
     elements.append(Spacer(1, 12))
 
-    data = [["رقم", "ریٹ", ur("مقدار"), ur("آئٹم")]]
+    data = [[_pcell("رقم", color="#FFFFFF"), _pcell("ریٹ", color="#FFFFFF"), _pcell("مقدار", color="#FFFFFF"), _pcell("آئٹم", color="#FFFFFF")]]
     for it in items:
-        data.append([f"Rs {it['amount']:.0f}", f"Rs {it['rate']:.0f}", f"{it['quantity']}{it['unit']}", ur(it["product_name"])])
+        data.append([_pcell(f"Rs {it['amount']:.0f}"), _pcell(f"Rs {it['rate']:.0f}"), _pcell(f"{it['quantity']}{it['unit']}"), _pcell(it["product_name"])])
     table = Table(data, colWidths=[25 * mm, 25 * mm, 25 * mm, 80 * mm])
     table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor((shop.get("primary_color") if shop else None) or "#3B6EA5")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONTNAME", (0, 0), (-1, -1), body_font),
-        ("FONTSIZE", (0, 0), (-1, -1), 9),
         ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
         ("ALIGN", (0, 0), (-1, -1), "RIGHT"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
     ]))
     elements.append(table)
     elements.append(Spacer(1, 14))
@@ -1130,23 +1144,23 @@ def generate_delivery_summary_pdf(shop, rows, period_label):
     elements = []
     body_font = _pdf_header(elements, shop, f"ڈیلیوری سمری — {period_label}")
 
-    data = [[ur("اسٹیٹس"), "رقم", ur("پروڈکٹس"), ur("رائیڈر"), ur("کسٹمر"), ur("وقت")]]
+    data = [[_pcell("اسٹیٹس", color="#FFFFFF"), _pcell("رقم", color="#FFFFFF"), _pcell("پروڈکٹس", color="#FFFFFF"), _pcell("رائیڈر", color="#FFFFFF"), _pcell("کسٹمر", color="#FFFFFF"), _pcell("وقت", color="#FFFFFF")]]
     total = 0
     for r in rows:
         data.append([
-            ur(r["status"]), f"Rs {r['total_amount']:.0f}", ur(r.get("items_summary") or "—"),
-            ur(r.get("rider_name") or "—"), ur(r.get("customer_name") or "—"), ur(format_ts(r["timestamp"]))
+            _pcell(r["status"]), _pcell(f"Rs {r['total_amount']:.0f}"), _pcell(r.get("items_summary") or "—"),
+            _pcell(r.get("rider_name") or "—"), _pcell(r.get("customer_name") or "—"), _pcell(format_ts(r["timestamp"]), font_size=8)
         ])
         if r["status"] != "missed":
             total += r["total_amount"]
     table = Table(data, colWidths=[18 * mm, 20 * mm, 40 * mm, 25 * mm, 30 * mm, 38 * mm], repeatRows=1)
     table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor((shop.get("primary_color") if shop else None) or "#3B6EA5")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONTNAME", (0, 0), (-1, -1), body_font),
-        ("FONTSIZE", (0, 0), (-1, -1), 8),
         ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
         ("ALIGN", (0, 0), (-1, -1), "RIGHT"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
         ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F8F9FB")]),
     ]))
     elements.append(table)
