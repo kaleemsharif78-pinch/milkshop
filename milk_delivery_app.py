@@ -34,6 +34,7 @@ import hashlib
 import io
 import os
 import re
+import base64
 import secrets
 import string
 import pandas as pd
@@ -140,6 +141,20 @@ def init_db():
             primary_color TEXT DEFAULT '#3B6EA5',
             logo_emoji TEXT DEFAULT '🥛',
             logo_text TEXT DEFAULT 'Doodh Delivery System',
+            created_at TEXT NOT NULL
+        )
+    """)
+    _add_column_if_missing(conn, "shops", "proprietor_name TEXT")
+    _add_column_if_missing(conn, "shops", "logo_image_base64 TEXT")
+    _add_column_if_missing(conn, "shops", "background_color TEXT DEFAULT '#FFFFFF'")
+    _add_column_if_missing(conn, "shops", "text_color TEXT DEFAULT '#1F2A37'")
+    _add_column_if_missing(conn, "shops", "secondary_color TEXT DEFAULT '#F1F3F5'")
+    _add_column_if_missing(conn, "shops", "accent_color TEXT DEFAULT '#5B8FC4'")
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS broadcast_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message TEXT NOT NULL,
             created_at TEXT NOT NULL
         )
     """)
@@ -597,6 +612,28 @@ def get_notifications(audience, shop_id, customer_id=None, limit=20):
     return [dict(r) for r in rows]
 
 
+# ----------------------------- MASTER ADMIN BROADCASTS -----------------------------
+
+def post_broadcast(message):
+    """Master Admin sends a greeting/update that every user of every shop sees."""
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO broadcast_messages (message,created_at) VALUES (?,?)",
+        (message, datetime.now().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_recent_broadcasts(limit=3):
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM broadcast_messages ORDER BY created_at DESC LIMIT ?", (limit,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
 # ----------------------------- RIDER CASH RECOVERY -----------------------------
 
 def rider_cash_in_hand(rider_id: int) -> float:
@@ -866,44 +903,51 @@ def customer_balance(customer_id):
 
 def apply_theme(shop=None):
     primary = (shop.get("primary_color") if shop else None) or "#3B6EA5"
+    bg = (shop.get("background_color") if shop else None) or "#FFFFFF"
+    text_color = (shop.get("text_color") if shop else None) or "#1F2A37"
+    secondary = (shop.get("secondary_color") if shop else None) or "#F1F3F5"
+    accent = (shop.get("accent_color") if shop else None) or "#5B8FC4"
     st.markdown(f"""
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap');
 
         html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"] {{
-            background-color: #FFFFFF !important;
-            color: #1F2A37 !important;
+            background-color: {bg} !important;
+            color: {text_color} !important;
             font-family: 'Poppins', sans-serif !important;
         }}
-        [data-testid="stHeader"] {{ background-color: #FFFFFF !important; }}
-        [data-testid="stSidebar"] {{ background-color: #F1F3F5 !important; }}
+        [data-testid="stHeader"] {{ background-color: {bg} !important; }}
+        [data-testid="stSidebar"] {{ background-color: {secondary} !important; }}
 
         .naba-banner {{
-            background: linear-gradient(90deg, {primary}CC 0%, {primary} 60%, {primary}AA 100%);
+            background: linear-gradient(90deg, {primary}CC 0%, {primary} 55%, {accent} 100%);
             padding: 18px 24px;
             border-radius: 14px;
             margin-bottom: 18px;
             box-shadow: 0 4px 14px rgba(0,0,0,0.15);
         }}
+        .naba-banner-row {{ display: flex; align-items: center; gap: 14px; }}
+        .naba-banner-logo-img {{ height: 46px; width: 46px; object-fit: contain; border-radius: 8px; background: #FFFFFF; padding: 3px; }}
         .naba-banner h1 {{ color: #FFFFFF !important; margin: 0; font-size: 26px; font-weight: 700; }}
-        .naba-banner p {{ color: #EAF0FA !important; margin: 2px 0 0 0; font-size: 13px; }}
+        .naba-banner p.proprietor {{ color: #EAF0FA !important; margin: 2px 0 0 0; font-size: 14px; font-weight: 500; }}
+        .naba-banner p.contact {{ color: #EAF0FA !important; opacity: 0.75; margin: 4px 0 0 0; font-size: 10px; }}
 
         [data-testid="stMetric"] {{
-            background-color: #F8F9FB !important;
+            background-color: {secondary} !important;
             padding: 14px !important;
             border-radius: 14px !important;
             border: 1px solid #E6E9EE !important;
             box-shadow: 0 2px 6px rgba(31,42,55,0.05);
         }}
         [data-testid="stMetricLabel"] {{ color: #6B7280 !important; }}
-        [data-testid="stMetricValue"] {{ color: #1F2A37 !important; font-weight: 600; }}
+        [data-testid="stMetricValue"] {{ color: {text_color} !important; font-weight: 600; }}
         [data-testid="stExpander"] {{
             border-radius: 12px !important;
             border: 1px solid #E6E9EE !important;
             box-shadow: 0 2px 6px rgba(31,42,55,0.04);
         }}
 
-        h1, h2, h3, h4, h5 {{ color: #1F2A37; font-weight: 600; }}
+        h1, h2, h3, h4, h5 {{ color: {text_color}; font-weight: 600; }}
         input, textarea, [data-baseweb="select"] > div {{ border-radius: 10px !important; }}
 
         .stButton > button {{
@@ -938,12 +982,31 @@ def apply_theme(shop=None):
 def render_banner(shop=None):
     emoji = (shop.get("logo_emoji") if shop else None) or "🥛"
     text = (shop.get("logo_text") if shop else None) or "Doodh Delivery System"
+    proprietor = shop.get("proprietor_name") if shop else None
+    logo_img = shop.get("logo_image_base64") if shop else None
+
+    logo_html = f'<img class="naba-banner-logo-img" src="data:image/png;base64,{logo_img}" />' if logo_img else f'<span style="font-size:34px;">{emoji}</span>'
+    proprietor_html = f'<p class="proprietor">{proprietor}</p>' if proprietor else ""
+
     st.markdown(f"""
     <div class="naba-banner">
-        <h1>{emoji} {text}</h1>
-        <p>NABA TECH BY KALEEM ULLAH SHARIF</p>
+        <div class="naba-banner-row">
+            {logo_html}
+            <div>
+                <h1>{text}</h1>
+                {proprietor_html}
+            </div>
+        </div>
+        <p class="contact">NABA Tech | Mobile: 03151186003</p>
     </div>
     """, unsafe_allow_html=True)
+
+
+def render_broadcasts():
+    """Shows the Master Admin's latest greeting/update messages to every user."""
+    broadcasts = get_recent_broadcasts(limit=3)
+    for b in broadcasts:
+        st.info(f"📢 {b['message']}")
 
 
 # ----------------------------- LICENSE LOCK SCREEN -----------------------------
@@ -1785,16 +1848,43 @@ def admin_panel(user):
     # ---- Branding (shop admin can tweak within their own shop) ----
     with tabs[9]:
         st.subheader("🎨 برانڈنگ")
-        st.caption("یہ رنگ اور لوگو صرف آپ کی اپنی شاپ پر لاگو ہوں گے۔")
+        st.caption("یہ صرف آپ کی اپنی شاپ پر لاگو ہوں گے۔")
         if shop:
-            new_color = st.color_picker("پرائمری رنگ", value=shop.get("primary_color") or "#3B6EA5")
-            new_logo_emoji = st.text_input("لوگو ایموجی", value=shop.get("logo_emoji") or "🥛")
-            new_logo_text = st.text_input("لوگو ٹیکسٹ", value=shop.get("logo_text") or "Doodh Delivery System")
-            if st.button("محفوظ کریں", type="primary"):
+            st.markdown("#### ٹیکسٹ اور لوگو")
+            new_logo_text = st.text_input("کمپنی کا نام / لوگو ٹیکسٹ (پہلی لائن)", value=shop.get("logo_text") or "Doodh Delivery System")
+            new_proprietor = st.text_input("پروپرائیٹر کا نام (دوسری لائن، اختیاری)", value=shop.get("proprietor_name") or "")
+            st.caption("تیسری لائن ہمیشہ ہلکی اور چھوٹی نظر آئے گی: \"NABA Tech | Mobile: 03151186003\" (یہ فکسڈ ہے، تبدیل نہیں ہوتی)۔")
+
+            st.markdown("#### لوگو")
+            current_logo = shop.get("logo_image_base64")
+            if current_logo:
+                st.image(base64.b64decode(current_logo), width=80, caption="موجودہ لوگو")
+                remove_logo = st.checkbox("لوگو ہٹا کر دوبارہ ایموجی استعمال کریں")
+            else:
+                remove_logo = False
+            new_logo_emoji = st.text_input("لوگو ایموجی (اگر PNG اپلوڈ نہ کریں تو یہ استعمال ہوگا)", value=shop.get("logo_emoji") or "🥛")
+            uploaded_logo = st.file_uploader("لوگو PNG اپلوڈ کریں (اختیاری)", type=["png"])
+
+            st.markdown("#### تھیم کے رنگ")
+            col1, col2 = st.columns(2)
+            new_primary = col1.color_picker("پرائمری رنگ (بٹنز/بینر)", value=shop.get("primary_color") or "#3B6EA5")
+            new_accent = col2.color_picker("ایکسنٹ رنگ (بینر گریڈینٹ)", value=shop.get("accent_color") or "#5B8FC4")
+            new_bg = col1.color_picker("بیک گراؤنڈ رنگ", value=shop.get("background_color") or "#FFFFFF")
+            new_text = col2.color_picker("ٹیکسٹ رنگ", value=shop.get("text_color") or "#1F2A37")
+            new_secondary = col1.color_picker("سیکنڈری رنگ (کارڈز/سائیڈ بار)", value=shop.get("secondary_color") or "#F1F3F5")
+
+            if st.button("✅ برانڈنگ محفوظ کریں", type="primary"):
                 conn = get_conn()
+                logo_b64 = current_logo
+                if uploaded_logo is not None:
+                    logo_b64 = base64.b64encode(uploaded_logo.getvalue()).decode()
+                elif remove_logo:
+                    logo_b64 = None
                 conn.execute(
-                    "UPDATE shops SET primary_color=?, logo_emoji=?, logo_text=? WHERE id=?",
-                    (new_color, new_logo_emoji, new_logo_text, shop_id)
+                    "UPDATE shops SET primary_color=?, logo_emoji=?, logo_text=?, proprietor_name=?, "
+                    "logo_image_base64=?, background_color=?, text_color=?, secondary_color=?, accent_color=? WHERE id=?",
+                    (new_primary, new_logo_emoji, new_logo_text, new_proprietor,
+                     logo_b64, new_bg, new_text, new_secondary, new_accent, shop_id)
                 )
                 conn.commit()
                 conn.close()
@@ -1953,7 +2043,7 @@ def customer_panel(user):
 
 def master_admin_panel(user):
     st.header("👑 ماسٹر ایڈمن پینل")
-    tabs = st.tabs(["🏪 شاپس", "🔑 لائسنس کیز", "📊 مانیٹرنگ"])
+    tabs = st.tabs(["🏪 شاپس", "🔑 لائسنس کیز", "📊 مانیٹرنگ", "📢 اعلان (Broadcast)"])
 
     with tabs[0]:
         st.subheader("نئی شاپ بنائیں")
@@ -2080,6 +2170,29 @@ def master_admin_panel(user):
         if shop_counts:
             st.dataframe(pd.DataFrame([dict(r) for r in shop_counts]), use_container_width=True, hide_index=True)
 
+    with tabs[3]:
+        st.subheader("📢 تمام یوزرز کو اعلان/گریٹنگ بھیجیں")
+        st.caption("یہ پیغام ہر شاپ کے ہر یوزر (ایڈمن، رائیڈر، کسٹمر) کو لاگ ان کرتے ہی نظر آئے گا۔")
+        msg = st.text_area("پیغام لکھیں", placeholder="مثلاً: عید مبارک! کل ڈیلیوری معمول کے مطابق جاری رہے گی۔")
+        if st.button("✅ سب کو بھیجیں", type="primary"):
+            if msg.strip():
+                post_broadcast(msg.strip())
+                st.success("اعلان بھیج دیا گیا — تمام یوزرز کو نظر آئے گا۔")
+                st.rerun()
+            else:
+                st.error("پہلے پیغام لکھیں۔")
+
+        st.divider()
+        st.subheader("پرانے اعلانات")
+        conn = get_conn()
+        history = [dict(r) for r in conn.execute("SELECT * FROM broadcast_messages ORDER BY created_at DESC LIMIT 20").fetchall()]
+        conn.close()
+        if history:
+            for h in history:
+                st.caption(f"[{format_ts(h['created_at'])}] {h['message']}")
+        else:
+            st.caption("ابھی تک کوئی اعلان نہیں بھیجا گیا۔")
+
 
 # ----------------------------- MAIN -----------------------------
 
@@ -2105,6 +2218,7 @@ def main():
         apply_theme(shop)
         render_banner(shop)
         logout_button()
+        render_broadcasts()
 
         allowed, _ = check_shop_access(user["shop_id"])
         if not allowed:
