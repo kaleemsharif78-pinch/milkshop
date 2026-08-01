@@ -153,6 +153,14 @@ def init_db():
     _add_column_if_missing(conn, "shops", "accent_color TEXT DEFAULT '#5B8FC4'")
 
     c.execute("""
+        CREATE TABLE IF NOT EXISTS login_attempts (
+            username TEXT PRIMARY KEY,
+            fail_count INTEGER DEFAULT 0,
+            locked_until TEXT
+        )
+    """)
+
+    c.execute("""
         CREATE TABLE IF NOT EXISTS broadcast_messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             message TEXT NOT NULL,
@@ -186,6 +194,18 @@ def init_db():
     """)
 
     c.execute("""
+        CREATE TABLE IF NOT EXISTS farms (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            shop_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            owner_name TEXT,
+            phone TEXT,
+            address TEXT,
+            active INTEGER DEFAULT 1
+        )
+    """)
+
+    c.execute("""
         CREATE TABLE IF NOT EXISTS farm_supply (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             shop_id INTEGER NOT NULL,
@@ -195,6 +215,7 @@ def init_db():
             timestamp TEXT NOT NULL
         )
     """)
+    _add_column_if_missing(conn, "farm_supply", "farm_id INTEGER")
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS license_keys (
@@ -437,6 +458,28 @@ def init_db():
                 "INSERT INTO products (name,unit,rate,is_default_quota_item,shop_id) VALUES (?,?,?,?,?)",
                 [(n, u, r, d, shop["id"]) for n, u, r, d in DEFAULT_PRODUCTS]
             )
+    conn.commit()
+
+    # one-time migration: pre-multi-farm supply rows (farm_id IS NULL) -> a per-shop "Default Farm"
+    orphan_shops = c.execute(
+        "SELECT DISTINCT shop_id FROM farm_supply WHERE farm_id IS NULL"
+    ).fetchall()
+    for row in orphan_shops:
+        sid = row["shop_id"]
+        existing_default = c.execute(
+            "SELECT id FROM farms WHERE shop_id=? AND name='Default Farm'", (sid,)
+        ).fetchone()
+        if existing_default:
+            default_farm_id = existing_default["id"]
+        else:
+            cur = c.execute(
+                "INSERT INTO farms (shop_id,name,owner_name,phone,address) VALUES (?,?,?,?,?)",
+                (sid, "Default Farm", "", "", "")
+            )
+            default_farm_id = cur.lastrowid
+        c.execute(
+            "UPDATE farm_supply SET farm_id=? WHERE shop_id=? AND farm_id IS NULL", (default_farm_id, sid)
+        )
     conn.commit()
     conn.close()
 
@@ -722,26 +765,65 @@ def get_walk_in_sale_items(sale_id):
 
 # ----------------------------- BAARA / FARM SUPPLY -----------------------------
 
-def record_farm_supply(shop_id, supply_date, quantity_kg, note=""):
+def add_farm(shop_id, name, owner_name="", phone="", address=""):
+    conn = get_conn()
+    cur = conn.execute(
+        "INSERT INTO farms (shop_id,name,owner_name,phone,address) VALUES (?,?,?,?,?)",
+        (shop_id, name, owner_name, phone, address)
+    )
+    conn.commit()
+    conn.close()
+    return cur.lastrowid
+
+
+def update_farm(farm_id, shop_id, name, owner_name, phone, address, active=True):
     conn = get_conn()
     conn.execute(
-        "INSERT INTO farm_supply (shop_id,supply_date,quantity_kg,note,timestamp) VALUES (?,?,?,?,?)",
-        (shop_id, supply_date, quantity_kg, note, datetime.now().isoformat())
+        "UPDATE farms SET name=?, owner_name=?, phone=?, address=?, active=? WHERE id=? AND shop_id=?",
+        (name, owner_name, phone, address, 1 if active else 0, farm_id, shop_id)
     )
     conn.commit()
     conn.close()
 
 
-def get_farm_supply(shop_id, date_filter=None, month_filter=None):
-    q = "SELECT * FROM farm_supply WHERE shop_id=?"
+def get_farms(shop_id, active_only=True):
+    conn = get_conn()
+    q = "SELECT * FROM farms WHERE shop_id=?"
     params = [shop_id]
+    if active_only:
+        q += " AND active=1"
+    q += " ORDER BY name"
+    rows = conn.execute(q, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def record_farm_supply(shop_id, farm_id, supply_date, quantity_kg, note=""):
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO farm_supply (shop_id,farm_id,supply_date,quantity_kg,note,timestamp) VALUES (?,?,?,?,?,?)",
+        (shop_id, farm_id, supply_date, quantity_kg, note, datetime.now().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_farm_supply(shop_id, farm_id=None, date_filter=None, month_filter=None):
+    q = (
+        "SELECT fs.*, f.name AS farm_name FROM farm_supply fs "
+        "LEFT JOIN farms f ON f.id=fs.farm_id WHERE fs.shop_id=?"
+    )
+    params = [shop_id]
+    if farm_id:
+        q += " AND fs.farm_id=?"
+        params.append(farm_id)
     if date_filter:
-        q += " AND supply_date=?"
+        q += " AND fs.supply_date=?"
         params.append(date_filter)
     if month_filter:
-        q += " AND supply_date LIKE ?"
+        q += " AND fs.supply_date LIKE ?"
         params.append(f"{month_filter}%")
-    q += " ORDER BY supply_date DESC"
+    q += " ORDER BY fs.supply_date DESC, fs.timestamp DESC"
     conn = get_conn()
     rows = conn.execute(q, params).fetchall()
     conn.close()
@@ -749,12 +831,19 @@ def get_farm_supply(shop_id, date_filter=None, month_filter=None):
 
 
 def get_daily_reconciliation(shop_id, day):
-    """Farm supply vs. subscription deliveries vs. walk-in sales, for the milk product only."""
+    """Farm supply (all farms combined) vs. subscription deliveries vs.
+    walk-in sales, for the milk product only."""
     conn = get_conn()
     farm_total = conn.execute(
         "SELECT COALESCE(SUM(quantity_kg),0) AS s FROM farm_supply WHERE shop_id=? AND supply_date=?",
         (shop_id, day)
     ).fetchone()["s"]
+    per_farm = conn.execute(
+        "SELECT f.name AS farm_name, COALESCE(SUM(fs.quantity_kg),0) AS total "
+        "FROM farm_supply fs LEFT JOIN farms f ON f.id=fs.farm_id "
+        "WHERE fs.shop_id=? AND fs.supply_date=? GROUP BY fs.farm_id ORDER BY total DESC",
+        (shop_id, day)
+    ).fetchall()
 
     milk = get_default_quota_product(shop_id)
     subscription_used = 0.0
@@ -777,7 +866,8 @@ def get_daily_reconciliation(shop_id, day):
     remaining = round(farm_total - subscription_used - walkin_sold, 2)
     return {
         "farm_total": farm_total, "subscription_used": subscription_used,
-        "walkin_sold": walkin_sold, "remaining": remaining, "milk_product": milk["name"] if milk else None
+        "walkin_sold": walkin_sold, "remaining": remaining, "milk_product": milk["name"] if milk else None,
+        "per_farm": [dict(r) for r in per_farm]
     }
 
 
@@ -966,6 +1056,47 @@ def fulfill_extra_order(order_id, delivery_txn_id):
 
 # ----------------------------- AUTH -----------------------------
 
+LOGIN_MAX_ATTEMPTS = 5
+LOGIN_LOCKOUT_MINUTES = 15
+_KNOWN_DEFAULT_PASSWORDS = ["admin123", "master123", "123456"]
+
+
+def check_login_lock(username):
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM login_attempts WHERE username=?", (username,)).fetchone()
+    conn.close()
+    if row and row["locked_until"] and datetime.fromisoformat(row["locked_until"]) > datetime.now():
+        return True, row["locked_until"]
+    return False, None
+
+
+def register_failed_login(username):
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM login_attempts WHERE username=?", (username,)).fetchone()
+    if row:
+        new_count = row["fail_count"] + 1
+        locked_until = (datetime.now() + timedelta(minutes=LOGIN_LOCKOUT_MINUTES)).isoformat() if new_count >= LOGIN_MAX_ATTEMPTS else None
+        conn.execute("UPDATE login_attempts SET fail_count=?, locked_until=? WHERE username=?", (new_count, locked_until, username))
+    else:
+        conn.execute("INSERT INTO login_attempts (username,fail_count,locked_until) VALUES (?,?,?)", (username, 1, None))
+    conn.commit()
+    conn.close()
+
+
+def clear_login_attempts(username):
+    conn = get_conn()
+    conn.execute("DELETE FROM login_attempts WHERE username=?", (username,))
+    conn.commit()
+    conn.close()
+
+
+def uses_known_default_password(user):
+    """Flags accounts still on a widely-published default (admin123 / master123 /
+    123456) — these are documented in this project's own README, so once this
+    software is sold commercially they must not be left unchanged."""
+    return user["password"] in {hash_pw(p) for p in _KNOWN_DEFAULT_PASSWORDS}
+
+
 def authenticate(username, password):
     conn = get_conn()
     row = conn.execute(
@@ -994,12 +1125,37 @@ def login_page():
         password = st.text_input("Password", type="password")
         submitted = st.form_submit_button("Login", use_container_width=True)
         if submitted:
-            user = authenticate(username.strip(), password)
-            if user:
-                st.session_state.user = user
-                st.rerun()
+            uname = username.strip()
+            locked, until = check_login_lock(uname)
+            if locked:
+                st.error(f"🔒 بہت زیادہ غلط کوششوں کی وجہ سے یہ اکاؤنٹ عارضی طور پر بند ہے۔ {format_ts(until)} کے بعد دوبارہ کوشش کریں۔")
             else:
-                st.error("غلط یوزرنیم یا پاسورڈ")
+                user = authenticate(uname, password)
+                if user:
+                    clear_login_attempts(uname)
+                    st.session_state.user = user
+                    st.rerun()
+                else:
+                    register_failed_login(uname)
+                    st.error("غلط یوزرنیم یا پاسورڈ")
+
+
+def force_password_change_screen(user):
+    st.warning("⚠️ سیکیورٹی وجہ سے آگے بڑھنے سے پہلے پاسورڈ تبدیل کرنا لازمی ہے — یہ اکاؤنٹ ابھی تک ایک معروف/ڈیفالٹ پاسورڈ پر ہے جو اس سافٹ ویئر کی اپنی دستاویزات میں بھی لکھا ہے۔")
+    new_pw = st.text_input("نیا پاسورڈ (کم از کم 6 حروف)", type="password", key="force_new_pw")
+    confirm_pw = st.text_input("پاسورڈ دوبارہ لکھیں", type="password", key="force_confirm_pw")
+    if st.button("✅ پاسورڈ تبدیل کریں اور آگے بڑھیں", type="primary"):
+        if len(new_pw) < 6:
+            st.error("پاسورڈ کم از کم 6 حروف کا ہونا چاہیے۔")
+        elif new_pw != confirm_pw:
+            st.error("دونوں پاسورڈ ایک جیسے نہیں ہیں۔")
+        elif new_pw in _KNOWN_DEFAULT_PASSWORDS:
+            st.error("یہ اب بھی ایک معروف ڈیفالٹ پاسورڈ ہے — کوئی مختلف پاسورڈ منتخب کریں۔")
+        else:
+            reset_user_password(user["id"], new_pw)
+            st.session_state.user["password"] = hash_pw(new_pw)
+            st.success("پاسورڈ تبدیل ہو گیا۔")
+            st.rerun()
 
 
 def logout_button():
@@ -2200,18 +2356,57 @@ def admin_panel(user):
 
     # ---- Baara / Farm milk reconciliation ----
     with tabs[11]:
-        st.subheader("🐄 باڑے سے آمد درج کریں")
-        with st.form("farm_supply_form"):
-            supply_date = st.date_input("تاریخ", value=date.today())
-            qty_kg = st.number_input("کل دودھ کی مقدار (kg)", min_value=0.0, step=1.0)
-            note = st.text_input("نوٹ (اختیاری)")
-            if st.form_submit_button("✅ درج کریں", type="primary"):
-                if qty_kg > 0:
-                    record_farm_supply(shop_id, supply_date.isoformat(), qty_kg, note)
-                    st.success("باڑے کی سپلائی درج ہو گئی۔")
+        st.subheader("🐄 باڑے شامل کریں")
+        with st.form("add_farm_form"):
+            f_name = st.text_input("باڑے کا نام")
+            f_owner = st.text_input("باڑے کے مالک کا نام")
+            f_phone = st.text_input("رابطہ نمبر")
+            f_address = st.text_input("مکمل پتہ")
+            if st.form_submit_button("✅ باڑہ شامل کریں", type="primary"):
+                if f_name:
+                    add_farm(shop_id, f_name, f_owner, f_phone, f_address)
+                    st.success(f"باڑہ '{f_name}' شامل ہو گیا۔")
                     st.rerun()
                 else:
-                    st.error("مقدار درج کریں۔")
+                    st.error("باڑے کا نام درج کریں۔")
+
+        farms = get_farms(shop_id)
+        st.divider()
+        st.subheader("موجودہ باڑے")
+        if farms:
+            for f in farms:
+                with st.expander(f"🐄 {f['name']}" + (f" — {f['owner_name']}" if f["owner_name"] else "")):
+                    with st.form(f"edit_farm_{f['id']}"):
+                        e_name = st.text_input("نام", value=f["name"], key=f"fname_{f['id']}")
+                        e_owner = st.text_input("مالک کا نام", value=f["owner_name"] or "", key=f"fowner_{f['id']}")
+                        e_phone = st.text_input("رابطہ نمبر", value=f["phone"] or "", key=f"fphone_{f['id']}")
+                        e_address = st.text_input("پتہ", value=f["address"] or "", key=f"faddr_{f['id']}")
+                        e_active = st.checkbox("فعال (Active)", value=bool(f["active"]), key=f"factive_{f['id']}")
+                        if st.form_submit_button("محفوظ کریں"):
+                            update_farm(f["id"], shop_id, e_name, e_owner, e_phone, e_address, e_active)
+                            st.success("باڑے کی تفصیل اپڈیٹ ہو گئی۔")
+                            st.rerun()
+        else:
+            st.caption("ابھی کوئی باڑہ شامل نہیں کیا گیا۔")
+
+        st.divider()
+        st.subheader("📥 روزانہ آمد درج کریں")
+        if farms:
+            with st.form("farm_supply_form"):
+                farm_names = [f["name"] for f in farms]
+                sel_farm = st.selectbox("باڑہ منتخب کریں", range(len(farm_names)), format_func=lambda i: farm_names[i])
+                supply_date = st.date_input("تاریخ", value=date.today())
+                qty_kg = st.number_input("دودھ کی مقدار (kg)", min_value=0.0, step=1.0)
+                note = st.text_input("نوٹ (اختیاری)")
+                if st.form_submit_button("✅ درج کریں", type="primary"):
+                    if qty_kg > 0:
+                        record_farm_supply(shop_id, farms[sel_farm]["id"], supply_date.isoformat(), qty_kg, note)
+                        st.success(f"'{farms[sel_farm]['name']}' سے {qty_kg}kg درج ہو گیا۔")
+                        st.rerun()
+                    else:
+                        st.error("مقدار درج کریں۔")
+        else:
+            st.warning("پہلے اوپر سے کم از کم ایک باڑہ شامل کریں۔")
 
         st.divider()
         st.subheader("📊 روزانہ حساب کا تقابل (Reconciliation)")
@@ -2219,20 +2414,25 @@ def admin_panel(user):
         recon = get_daily_reconciliation(shop_id, recon_date.isoformat())
         if recon["milk_product"]:
             m1, m2, m3, m4 = st.columns(4)
-            m1.metric("باڑے سے آیا", f"{recon['farm_total']:.2f} kg")
+            m1.metric("باڑوں سے کل آیا", f"{recon['farm_total']:.2f} kg")
             m2.metric("سبسکرپشن میں گیا", f"{recon['subscription_used']:.2f} kg")
             m3.metric("واکنگ کسٹمرز کو بکا", f"{recon['walkin_sold']:.2f} kg")
             m4.metric("باقی بچا", f"{recon['remaining']:.2f} kg")
             if recon["remaining"] < 0:
-                st.error("⚠️ خرچ باڑے سے آئے دودھ سے زیادہ ہو گیا ہے — ریکارڈ چیک کریں۔")
+                st.error("⚠️ خرچ باڑوں سے آئے دودھ سے زیادہ ہو گیا ہے — ریکارڈ چیک کریں۔")
+
+            if recon["per_farm"]:
+                st.markdown("#### باڑہ وائز آمد (اس تاریخ)")
+                per_farm_rows = [{"باڑہ": r["farm_name"] or "—", "مقدار (kg)": r["total"]} for r in recon["per_farm"]]
+                st.dataframe(pd.DataFrame(per_farm_rows), use_container_width=True, hide_index=True)
         else:
             st.warning("پہلے پروڈکٹس میں دودھ کو ⭐ ڈیفالٹ آئٹم کے طور پر سیٹ کریں۔")
 
         st.divider()
-        st.subheader("باڑے کی حالیہ ہسٹری")
+        st.subheader("باڑے کی حالیہ ہسٹری (تمام باڑے)")
         farm_rows = get_farm_supply(shop_id)
         if farm_rows:
-            display_rows = [{"تاریخ": r["supply_date"], "مقدار (kg)": r["quantity_kg"], "نوٹ": r["note"] or "—"} for r in farm_rows[:30]]
+            display_rows = [{"تاریخ": r["supply_date"], "باڑہ": r["farm_name"] or "—", "مقدار (kg)": r["quantity_kg"], "نوٹ": r["note"] or "—"} for r in farm_rows[:30]]
             st.dataframe(pd.DataFrame(display_rows), use_container_width=True, hide_index=True)
         else:
             st.caption("ابھی تک کوئی باڑے کی انٹری نہیں ہوئی۔")
@@ -2558,7 +2758,10 @@ def main():
         apply_theme()
         render_banner()
         logout_button()
-        master_admin_panel(user)
+        if uses_known_default_password(user):
+            force_password_change_screen(user)
+        else:
+            master_admin_panel(user)
     else:
         shop = get_shop(user["shop_id"])
         apply_theme(shop)
@@ -2566,15 +2769,18 @@ def main():
         logout_button()
         render_broadcasts()
 
-        allowed, _ = check_shop_access(user["shop_id"])
-        if not allowed:
-            license_lock_screen(user)
-        elif user["role"] == "admin":
-            admin_panel(user)
-        elif user["role"] == "rider":
-            rider_panel(user)
-        elif user["role"] == "customer":
-            customer_panel(user)
+        if user["role"] == "admin" and uses_known_default_password(user):
+            force_password_change_screen(user)
+        else:
+            allowed, _ = check_shop_access(user["shop_id"])
+            if not allowed:
+                license_lock_screen(user)
+            elif user["role"] == "admin":
+                admin_panel(user)
+            elif user["role"] == "rider":
+                rider_panel(user)
+            elif user["role"] == "customer":
+                customer_panel(user)
 
     st.markdown("---")
     st.caption("NABA TECH BY KALEEM ULLAH SHARIF")
