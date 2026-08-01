@@ -28,6 +28,7 @@ Both will be built on top of this foundation next.
 """
 
 import streamlit as st
+import streamlit.components.v1 as components
 import sqlite3
 from datetime import datetime, date, timedelta
 import hashlib
@@ -156,6 +157,42 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             message TEXT NOT NULL,
             created_at TEXT NOT NULL
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS walk_in_sales (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            shop_id INTEGER NOT NULL,
+            total_amount REAL NOT NULL,
+            payment_method TEXT DEFAULT 'cash',
+            sale_date TEXT NOT NULL,
+            timestamp TEXT NOT NULL
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS walk_in_sale_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sale_id INTEGER NOT NULL,
+            product_id INTEGER,
+            product_name TEXT NOT NULL,
+            unit TEXT NOT NULL,
+            quantity REAL NOT NULL,
+            rate REAL NOT NULL,
+            amount REAL NOT NULL,
+            FOREIGN KEY(sale_id) REFERENCES walk_in_sales(id)
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS farm_supply (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            shop_id INTEGER NOT NULL,
+            supply_date TEXT NOT NULL,
+            quantity_kg REAL NOT NULL,
+            note TEXT,
+            timestamp TEXT NOT NULL
         )
     """)
 
@@ -632,6 +669,116 @@ def get_recent_broadcasts(limit=3):
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+# ----------------------------- WALK-IN CUSTOMER / POS -----------------------------
+
+def record_walk_in_sale(shop_id, cart_items, payment_method="cash"):
+    """Counter cash sale for a walk-in (non-subscription) customer."""
+    total_amount = round(sum(it["qty"] * it["rate"] for it in cart_items), 2)
+    conn = get_conn()
+    cur = conn.execute(
+        "INSERT INTO walk_in_sales (shop_id,total_amount,payment_method,sale_date,timestamp) VALUES (?,?,?,?,?)",
+        (shop_id, total_amount, payment_method, date.today().isoformat(), datetime.now().isoformat())
+    )
+    sale_id = cur.lastrowid
+    for it in cart_items:
+        amount = round(it["qty"] * it["rate"], 2)
+        conn.execute(
+            "INSERT INTO walk_in_sale_items (sale_id,product_id,product_name,unit,quantity,rate,amount) VALUES (?,?,?,?,?,?,?)",
+            (sale_id, it.get("product_id"), it["product_name"], it["unit"], it["qty"], it["rate"], amount)
+        )
+    conn.commit()
+    conn.close()
+    return sale_id, total_amount
+
+
+def get_walk_in_sales(shop_id, date_filter=None, month_filter=None):
+    q = (
+        "SELECT ws.*, GROUP_CONCAT(wsi.product_name || ' ' || wsi.quantity || wsi.unit, ', ') AS items_summary "
+        "FROM walk_in_sales ws LEFT JOIN walk_in_sale_items wsi ON wsi.sale_id=ws.id "
+        "WHERE ws.shop_id=?"
+    )
+    params = [shop_id]
+    if date_filter:
+        q += " AND ws.sale_date=?"
+        params.append(date_filter)
+    if month_filter:
+        q += " AND ws.sale_date LIKE ?"
+        params.append(f"{month_filter}%")
+    q += " GROUP BY ws.id ORDER BY ws.timestamp DESC"
+    conn = get_conn()
+    rows = conn.execute(q, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_walk_in_sale_items(sale_id):
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM walk_in_sale_items WHERE sale_id=?", (sale_id,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+# ----------------------------- BAARA / FARM SUPPLY -----------------------------
+
+def record_farm_supply(shop_id, supply_date, quantity_kg, note=""):
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO farm_supply (shop_id,supply_date,quantity_kg,note,timestamp) VALUES (?,?,?,?,?)",
+        (shop_id, supply_date, quantity_kg, note, datetime.now().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_farm_supply(shop_id, date_filter=None, month_filter=None):
+    q = "SELECT * FROM farm_supply WHERE shop_id=?"
+    params = [shop_id]
+    if date_filter:
+        q += " AND supply_date=?"
+        params.append(date_filter)
+    if month_filter:
+        q += " AND supply_date LIKE ?"
+        params.append(f"{month_filter}%")
+    q += " ORDER BY supply_date DESC"
+    conn = get_conn()
+    rows = conn.execute(q, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_daily_reconciliation(shop_id, day):
+    """Farm supply vs. subscription deliveries vs. walk-in sales, for the milk product only."""
+    conn = get_conn()
+    farm_total = conn.execute(
+        "SELECT COALESCE(SUM(quantity_kg),0) AS s FROM farm_supply WHERE shop_id=? AND supply_date=?",
+        (shop_id, day)
+    ).fetchone()["s"]
+
+    milk = get_default_quota_product(shop_id)
+    subscription_used = 0.0
+    walkin_sold = 0.0
+    if milk:
+        subscription_used = conn.execute(
+            "SELECT COALESCE(SUM(di.quantity),0) AS s FROM delivery_items di "
+            "JOIN delivery_txns dt ON dt.id=di.transaction_id "
+            "WHERE dt.shop_id=? AND dt.delivery_date=? AND dt.status='delivered' AND di.product_name=?",
+            (shop_id, day, milk["name"])
+        ).fetchone()["s"]
+        walkin_sold = conn.execute(
+            "SELECT COALESCE(SUM(wsi.quantity),0) AS s FROM walk_in_sale_items wsi "
+            "JOIN walk_in_sales ws ON ws.id=wsi.sale_id "
+            "WHERE ws.shop_id=? AND ws.sale_date=? AND wsi.product_name=?",
+            (shop_id, day, milk["name"])
+        ).fetchone()["s"]
+    conn.close()
+
+    remaining = round(farm_total - subscription_used - walkin_sold, 2)
+    return {
+        "farm_total": farm_total, "subscription_used": subscription_used,
+        "walkin_sold": walkin_sold, "remaining": remaining, "milk_product": milk["name"] if milk else None
+    }
 
 
 # ----------------------------- RIDER CASH RECOVERY -----------------------------
@@ -1240,6 +1387,96 @@ def generate_delivery_summary_pdf(shop, rows, period_label):
     return buf
 
 
+def generate_walkin_sales_pdf(shop, rows, period_label):
+    """A4 PDF report of walk-in (counter/POS) cash sales for a day or month."""
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=24 * mm, bottomMargin=20 * mm, leftMargin=18 * mm, rightMargin=18 * mm)
+    elements = []
+    body_font = _pdf_header(elements, shop, f"کاؤنٹر سیل رپورٹ — {period_label}")
+
+    data = [[_pcell("طریقہ", color="#FFFFFF"), _pcell("رقم", color="#FFFFFF"), _pcell("آئٹمز", color="#FFFFFF"), _pcell("وقت", color="#FFFFFF")]]
+    total = 0
+    for r in rows:
+        data.append([_pcell(r["payment_method"]), _pcell(f"Rs {r['total_amount']:.0f}"), _pcell(r.get("items_summary") or "—"), _pcell(format_ts(r["timestamp"]), font_size=8)])
+        total += r["total_amount"]
+    table = Table(data, colWidths=[20 * mm, 25 * mm, 75 * mm, 34 * mm], repeatRows=1)
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor((shop.get("primary_color") if shop else None) or "#3B6EA5")),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("ALIGN", (0, 0), (-1, -1), "RIGHT"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F8F9FB")]),
+    ]))
+    elements.append(table)
+    elements.append(Spacer(1, 14))
+    bold_style = ParagraphStyle("BoldUrW", fontName=pick_font("کل سیلز", heading=True), fontSize=13, leading=22, alignment=2, textColor=colors.HexColor("#1F2A37"))
+    elements.append(Paragraph(ur(f"کل سیلز: {len(rows)}   |   کل رقم: Rs {total:.0f}"), bold_style))
+
+    doc.build(elements)
+    buf.seek(0)
+    return buf
+
+
+# ----------------------------- THERMAL (POS) RECEIPT -----------------------------
+
+def generate_qr_base64(data, box_size=3):
+    if not (QR_AVAILABLE and data):
+        return None
+    img = qrcode.make(str(data), box_size=box_size, border=2)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def render_thermal_receipt(shop, title, item_rows, total_amount, ref_label, paper_width_mm=58, extra_note=None):
+    """Renders a browser-printable thermal receipt (58mm/80mm) with a
+    'Print' button that calls window.print(). Most USB/Bluetooth POS
+    thermal printers install as a normal OS print driver, so the browser's
+    native print dialog picks them up — this is NOT raw ESC/POS printing
+    (that would need Web Bluetooth + printer-specific command bytes)."""
+    logo_text = (shop.get("logo_text") if shop else None) or "Doodh Delivery System"
+    proprietor = (shop.get("proprietor_name") if shop else None) or ""
+    primary = (shop.get("primary_color") if shop else None) or "#3B6EA5"
+
+    qr_b64 = generate_qr_base64(ref_label, box_size=3)
+    qr_html = f'<div class="qr"><img src="data:image/png;base64,{qr_b64}" width="90" /></div>' if qr_b64 else ""
+    proprietor_html = f'<div class="center">{proprietor}</div>' if proprietor else ""
+    rows_html = "".join(
+        f'<tr><td class="item">{r["name"]}</td><td class="qty">{r["qty"]}</td><td class="amt">{r["amount"]:.0f}</td></tr>'
+        for r in item_rows
+    )
+    now_label = format_ts(datetime.now().isoformat())
+    footer_note = extra_note or "شکریہ! دوبارہ تشریف لائیں۔"
+
+    html = (
+        "<html><head><meta charset='utf-8'><style>"
+        f"@media print {{ @page {{ size: {paper_width_mm}mm auto; margin: 2mm; }} .no-print {{ display: none; }} }}"
+        f"body {{ font-family: 'Noto Nastaliq Urdu','Courier New',monospace; width: {paper_width_mm}mm; margin:0 auto; font-size:12px; color:#000; }}"
+        ".center { text-align:center; } .shop-name { font-size:15px; font-weight:bold; }"
+        ".line { border-top:1px dashed #000; margin:5px 0; }"
+        "table { width:100%; border-collapse:collapse; font-size:11px; } td { padding:2px 0; vertical-align:top; }"
+        ".qty, .amt { text-align:right; white-space:nowrap; } .total-row { font-size:13px; font-weight:bold; }"
+        ".qr { text-align:center; margin-top:8px; } .footer { text-align:center; margin-top:6px; font-size:10px; }"
+        f".print-btn {{ display:block; width:100%; margin:10px 0; padding:10px; background:{primary}; color:#fff; border:none; border-radius:6px; font-size:14px; }}"
+        "</style></head><body dir='rtl'>"
+        "<div class='no-print'><button class='print-btn' onclick='window.print()'>🖨️ پرنٹ کریں</button></div>"
+        f"<div class='center shop-name'>{logo_text}</div>"
+        f"{proprietor_html}"
+        f"<div class='center'>{title}</div>"
+        f"<div class='center'>{now_label}</div>"
+        "<div class='line'></div>"
+        f"<table><tr><td class='item'><b>آئٹم</b></td><td class='qty'><b>مقدار</b></td><td class='amt'><b>رقم</b></td></tr>{rows_html}</table>"
+        "<div class='line'></div>"
+        f"<table><tr class='total-row'><td class='item'>کل رقم</td><td class='qty'></td><td class='amt'>Rs {total_amount:.0f}</td></tr></table>"
+        f"{qr_html}"
+        f"<div class='footer'>{footer_note}<br/>NABA Tech | Mobile: 03151186003</div>"
+        "</body></html>"
+    )
+    components.html(html, height=520, scrolling=True)
+
+
 # ----------------------------- RIDER PANEL -----------------------------
 
 def rider_panel(user):
@@ -1452,7 +1689,8 @@ def admin_panel(user):
 
     tabs = st.tabs([
         "📡 لائیو ٹریکنگ", "🛒 اضافی آرڈرز", "🧀 پروڈکٹس / ریٹس", "👥 کسٹمرز", "🛵 رائیڈرز",
-        "📒 کھاتہ / لیجر", "💵 وصولی درج کریں", "🧾 کیش سیٹلمنٹ", "🔑 پاسورڈز", "🎨 برانڈنگ"
+        "📒 کھاتہ / لیجر", "💵 وصولی درج کریں", "🧾 کیش سیٹلمنٹ", "🔑 پاسورڈز", "🎨 برانڈنگ",
+        "🧾 کاؤنٹر سیل (POS)", "🐄 باڑا / فارم"
     ])
 
     # ---- Live tracking + admin notifications ----
@@ -1894,6 +2132,110 @@ def admin_panel(user):
                 conn.close()
                 st.success("برانڈنگ محفوظ ہو گئی۔")
                 st.rerun()
+
+    # ---- Walk-in Customer / POS ----
+    with tabs[10]:
+        st.subheader("🧾 کاؤنٹر / واکنگ کسٹمر — فوری نقد سیل")
+        if "pos_cart" not in st.session_state:
+            st.session_state.pos_cart = []
+
+        pos_products = get_products(shop_id)
+        for p in pos_products:
+            pcols = st.columns(len(unit_presets(p["unit"])) + 1)
+            pcols[0].write(f"**{p['name']}** — Rs {p['rate']:.0f}/{p['unit']}")
+            for col, (label, qty) in zip(pcols[1:], unit_presets(p["unit"])):
+                if col.button(f"➕ {label}", key=f"pos_qa_{p['id']}_{label}", use_container_width=True):
+                    st.session_state.pos_cart.append({
+                        "product_id": p["id"], "product_name": p["name"], "unit": p["unit"], "qty": qty, "rate": p["rate"]
+                    })
+                    st.rerun()
+
+        if st.session_state.pos_cart:
+            st.divider()
+            st.markdown("#### کارٹ")
+            for i, it in enumerate(st.session_state.pos_cart):
+                c1, c2 = st.columns([4, 1])
+                c1.write(f"{it['product_name']} — {it['qty']}{it['unit']} = Rs {it['qty']*it['rate']:.0f}")
+                if c2.button("🗑️", key=f"pos_del_{i}"):
+                    st.session_state.pos_cart.pop(i)
+                    st.rerun()
+
+            pos_total = sum(it["qty"] * it["rate"] for it in st.session_state.pos_cart)
+            st.markdown(f"**کل رقم: Rs {pos_total:.0f}**")
+            payment_method = st.selectbox("ادائیگی کا طریقہ", ["cash", "online"], key="pos_payment_method")
+
+            if st.button("✅ سیل مکمل کریں", type="primary", use_container_width=True):
+                sale_id, amount = record_walk_in_sale(shop_id, st.session_state.pos_cart, payment_method)
+                st.session_state.pos_last_sale = sale_id
+                st.session_state.pos_cart = []
+                st.success(f"سیل #{sale_id} مکمل ہو گئی — Rs {amount:.0f}")
+                st.rerun()
+        else:
+            st.caption("اوپر بٹن دبا کر آئٹمز شامل کریں۔")
+
+        if st.session_state.get("pos_last_sale"):
+            st.divider()
+            st.subheader("🖨️ آخری سیل کی رسید")
+            sale = next((s for s in get_walk_in_sales(shop_id) if s["id"] == st.session_state.pos_last_sale), None)
+            if sale:
+                items = get_walk_in_sale_items(sale["id"])
+                paper = st.radio("پیپر سائز", ["58mm", "80mm"], horizontal=True, key="pos_paper_width")
+                width_mm = 58 if paper == "58mm" else 80
+                item_rows = [{"name": it["product_name"], "qty": f"{it['quantity']}{it['unit']}", "amount": it["amount"]} for it in items]
+                render_thermal_receipt(shop, "کاؤنٹر سیل رسید", item_rows, sale["total_amount"], f"WalkIn-{sale['id']}", paper_width_mm=width_mm)
+
+        st.divider()
+        st.subheader("📋 آج کی کاؤنٹر سیلز")
+        today = date.today().isoformat()
+        today_sales = get_walk_in_sales(shop_id, date_filter=today)
+        if today_sales:
+            display_rows = [{"وقت": format_ts(s["timestamp"]), "آئٹمز": s["items_summary"] or "—", "رقم": s["total_amount"], "طریقہ": s["payment_method"]} for s in today_sales]
+            st.dataframe(pd.DataFrame(display_rows), use_container_width=True, hide_index=True)
+            st.metric("آج کاؤنٹر سیلز کل رقم", f"Rs {sum(s['total_amount'] for s in today_sales):.0f}")
+            if PDF_AVAILABLE:
+                pdf_buf = generate_walkin_sales_pdf(shop, today_sales, today)
+                st.download_button("📄 آج کی POS رپورٹ PDF", data=pdf_buf, file_name=f"pos_report_{today}.pdf", mime="application/pdf")
+        else:
+            st.caption("آج ابھی تک کوئی کاؤنٹر سیل نہیں ہوئی۔")
+
+    # ---- Baara / Farm milk reconciliation ----
+    with tabs[11]:
+        st.subheader("🐄 باڑے سے آمد درج کریں")
+        with st.form("farm_supply_form"):
+            supply_date = st.date_input("تاریخ", value=date.today())
+            qty_kg = st.number_input("کل دودھ کی مقدار (kg)", min_value=0.0, step=1.0)
+            note = st.text_input("نوٹ (اختیاری)")
+            if st.form_submit_button("✅ درج کریں", type="primary"):
+                if qty_kg > 0:
+                    record_farm_supply(shop_id, supply_date.isoformat(), qty_kg, note)
+                    st.success("باڑے کی سپلائی درج ہو گئی۔")
+                    st.rerun()
+                else:
+                    st.error("مقدار درج کریں۔")
+
+        st.divider()
+        st.subheader("📊 روزانہ حساب کا تقابل (Reconciliation)")
+        recon_date = st.date_input("تاریخ منتخب کریں", value=date.today(), key="recon_date")
+        recon = get_daily_reconciliation(shop_id, recon_date.isoformat())
+        if recon["milk_product"]:
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("باڑے سے آیا", f"{recon['farm_total']:.2f} kg")
+            m2.metric("سبسکرپشن میں گیا", f"{recon['subscription_used']:.2f} kg")
+            m3.metric("واکنگ کسٹمرز کو بکا", f"{recon['walkin_sold']:.2f} kg")
+            m4.metric("باقی بچا", f"{recon['remaining']:.2f} kg")
+            if recon["remaining"] < 0:
+                st.error("⚠️ خرچ باڑے سے آئے دودھ سے زیادہ ہو گیا ہے — ریکارڈ چیک کریں۔")
+        else:
+            st.warning("پہلے پروڈکٹس میں دودھ کو ⭐ ڈیفالٹ آئٹم کے طور پر سیٹ کریں۔")
+
+        st.divider()
+        st.subheader("باڑے کی حالیہ ہسٹری")
+        farm_rows = get_farm_supply(shop_id)
+        if farm_rows:
+            display_rows = [{"تاریخ": r["supply_date"], "مقدار (kg)": r["quantity_kg"], "نوٹ": r["note"] or "—"} for r in farm_rows[:30]]
+            st.dataframe(pd.DataFrame(display_rows), use_container_width=True, hide_index=True)
+        else:
+            st.caption("ابھی تک کوئی باڑے کی انٹری نہیں ہوئی۔")
 
 
 # ----------------------------- CUSTOMER PANEL -----------------------------
