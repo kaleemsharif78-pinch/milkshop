@@ -282,28 +282,6 @@ def init_db():
         )
     """)
     _add_column_if_missing(conn, "products", "shop_id INTEGER")
-    _add_column_if_missing(conn, "products", "stock_qty REAL DEFAULT 0")
-    _add_column_if_missing(conn, "products", "low_stock_threshold REAL DEFAULT 0")
-    _add_column_if_missing(conn, "products", "image_base64 TEXT")
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS stock_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            product_id INTEGER NOT NULL,
-            delta REAL NOT NULL,
-            note TEXT,
-            timestamp TEXT NOT NULL
-        )
-    """)
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS shop_broadcasts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            shop_id INTEGER NOT NULL,
-            message TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )
-    """)
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS delivery_txns (
@@ -628,79 +606,21 @@ def get_default_quota_product(shop_id):
     return dict(row) if row else None
 
 
-def add_product(shop_id, name, unit, rate, low_stock_threshold=0, image_base64=None):
+def add_product(shop_id, name, unit, rate):
+    conn = get_conn()
+    conn.execute("INSERT INTO products (name,unit,rate,shop_id) VALUES (?,?,?,?)", (name, unit, rate, shop_id))
+    conn.commit()
+    conn.close()
+
+
+def update_product(product_id, shop_id, name, unit, rate, active):
     conn = get_conn()
     conn.execute(
-        "INSERT INTO products (name,unit,rate,shop_id,low_stock_threshold,image_base64,stock_qty) VALUES (?,?,?,?,?,?,0)",
-        (name, unit, rate, shop_id, low_stock_threshold, image_base64)
+        "UPDATE products SET name=?, unit=?, rate=?, active=? WHERE id=? AND shop_id=?",
+        (name, unit, rate, 1 if active else 0, product_id, shop_id)
     )
     conn.commit()
     conn.close()
-
-
-def update_product(product_id, shop_id, name, unit, rate, active, low_stock_threshold=None, image_base64=None):
-    conn = get_conn()
-    if low_stock_threshold is not None and image_base64 is not None:
-        conn.execute(
-            "UPDATE products SET name=?, unit=?, rate=?, active=?, low_stock_threshold=?, image_base64=? WHERE id=? AND shop_id=?",
-            (name, unit, rate, 1 if active else 0, low_stock_threshold, image_base64, product_id, shop_id)
-        )
-    elif low_stock_threshold is not None:
-        conn.execute(
-            "UPDATE products SET name=?, unit=?, rate=?, active=?, low_stock_threshold=? WHERE id=? AND shop_id=?",
-            (name, unit, rate, 1 if active else 0, low_stock_threshold, product_id, shop_id)
-        )
-    else:
-        conn.execute(
-            "UPDATE products SET name=?, unit=?, rate=?, active=? WHERE id=? AND shop_id=?",
-            (name, unit, rate, 1 if active else 0, product_id, shop_id)
-        )
-    conn.commit()
-    conn.close()
-
-
-# ----------------------------- STOCK / INVENTORY -----------------------------
-
-def adjust_stock(product_id, delta, note=""):
-    """Positive delta = stock in (restock), negative = stock out (sale/delivery).
-    Every change is logged for an auditable trail."""
-    conn = get_conn()
-    conn.execute("UPDATE products SET stock_qty = stock_qty + ? WHERE id=?", (delta, product_id))
-    conn.execute(
-        "INSERT INTO stock_log (product_id,delta,note,timestamp) VALUES (?,?,?,?)",
-        (product_id, delta, note, datetime.now().isoformat())
-    )
-    conn.commit()
-    conn.close()
-
-
-def deduct_stock_for_items(cart_items, ref_note=""):
-    """Auto-deduction hook — called after a POS sale or a confirmed delivery
-    so stock always reflects what's physically left the shop."""
-    for it in cart_items:
-        pid = it.get("product_id")
-        if pid:
-            adjust_stock(pid, -abs(it["qty"]), ref_note)
-
-
-def get_low_stock_products(shop_id):
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT * FROM products WHERE shop_id=? AND active=1 AND low_stock_threshold > 0 AND stock_qty <= low_stock_threshold "
-        "ORDER BY stock_qty ASC",
-        (shop_id,)
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-
-def get_stock_log(product_id, limit=20):
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT * FROM stock_log WHERE product_id=? ORDER BY timestamp DESC LIMIT ?", (product_id, limit)
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
 
 
 # ----------------------------- ENCRYPTION / QR -----------------------------
@@ -794,27 +714,6 @@ def get_recent_broadcasts(limit=3):
     return [dict(r) for r in rows]
 
 
-def post_shop_broadcast(shop_id, message):
-    """Shop admin sends a message that only THEIR OWN shop's customers see
-    (offers/updates) — separate from the Master Admin's system-wide broadcast."""
-    conn = get_conn()
-    conn.execute(
-        "INSERT INTO shop_broadcasts (shop_id,message,created_at) VALUES (?,?,?)",
-        (shop_id, message, datetime.now().isoformat())
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_shop_broadcasts(shop_id, limit=3):
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT * FROM shop_broadcasts WHERE shop_id=? ORDER BY created_at DESC LIMIT ?", (shop_id, limit)
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-
 # ----------------------------- WALK-IN CUSTOMER / POS -----------------------------
 
 def record_walk_in_sale(shop_id, cart_items, payment_method="cash"):
@@ -834,7 +733,6 @@ def record_walk_in_sale(shop_id, cart_items, payment_method="cash"):
         )
     conn.commit()
     conn.close()
-    deduct_stock_for_items(cart_items, ref_note=f"POS Sale #{sale_id}")
     return sale_id, total_amount
 
 
@@ -1039,7 +937,6 @@ def confirm_delivery(customer_id, rider_id, cart_items, shop_id, status="deliver
     conn.close()
 
     if status == "delivered" and cart_items:
-        deduct_stock_for_items(cart_items, ref_note=f"Delivery #{txn_id}")
         summary = items_summary_text(cart_items)
         push_notification(customer_id, f"آپ کے ہاں {summary} ڈیلیور ہوا — رقم Rs {total_amount:.0f}", shop_id, audience="customer", delivery_id=txn_id)
         push_notification(customer_id, f"ڈیلیوری کنفرم ہوئی — {summary} / Rs {total_amount:.0f}", shop_id, audience="admin", delivery_id=txn_id)
@@ -1243,34 +1140,7 @@ def login_page():
                     st.error("غلط یوزرنیم یا پاسورڈ")
 
 
-def change_own_password(user, current_password, new_password):
-    if hash_pw(current_password) != user["password"]:
-        return False, "موجودہ پاسورڈ غلط ہے۔"
-    if len(new_password) < 6:
-        return False, "نیا پاسورڈ کم از کم 6 حروف کا ہونا چاہیے۔"
-    reset_user_password(user["id"], new_password)
-    return True, "پاسورڈ تبدیل ہو گیا۔"
-
-
-def render_change_own_password(user):
-    st.subheader("🔑 اپنا پاسورڈ تبدیل کریں")
-    with st.form(f"change_own_pw_{user['id']}"):
-        current_pw = st.text_input("موجودہ پاسورڈ", type="password")
-        new_pw = st.text_input("نیا پاسورڈ (کم از کم 6 حروف)", type="password")
-        confirm_pw = st.text_input("نیا پاسورڈ دوبارہ لکھیں", type="password")
-        if st.form_submit_button("✅ پاسورڈ تبدیل کریں", type="primary"):
-            if new_pw != confirm_pw:
-                st.error("دونوں نئے پاسورڈ ایک جیسے نہیں ہیں۔")
-            else:
-                ok, msg = change_own_password(user, current_pw, new_pw)
-                if ok:
-                    st.session_state.user["password"] = hash_pw(new_pw)
-                    st.success(msg)
-                else:
-                    st.error(msg)
-
-
-
+def force_password_change_screen(user):
     st.warning("⚠️ سیکیورٹی وجہ سے آگے بڑھنے سے پہلے پاسورڈ تبدیل کرنا لازمی ہے — یہ اکاؤنٹ ابھی تک ایک معروف/ڈیفالٹ پاسورڈ پر ہے جو اس سافٹ ویئر کی اپنی دستاویزات میں بھی لکھا ہے۔")
     new_pw = st.text_input("نیا پاسورڈ (کم از کم 6 حروف)", type="password", key="force_new_pw")
     confirm_pw = st.text_input("پاسورڈ دوبارہ لکھیں", type="password", key="force_confirm_pw")
@@ -1408,20 +1278,6 @@ def apply_theme(shop=None):
         [data-baseweb="tab-highlight"] {{ background-color: {primary} !important; }}
         [data-baseweb="tab-list"] {{ border-bottom-color: #E2E5E9 !important; }}
         a, a:visited {{ color: {primary} !important; }}
-
-        .stock-alert-box {{
-            background-color: #FDECEA;
-            border: 2px solid #E53935;
-            border-radius: 10px;
-            padding: 10px 16px;
-            margin: 6px 0;
-            animation: stockBlink 1s infinite;
-        }}
-        .stock-alert-box b {{ color: #B71C1C; }}
-        @keyframes stockBlink {{
-            0%, 100% {{ opacity: 1; }}
-            50% {{ opacity: 0.45; }}
-        }}
     </style>
     """, unsafe_allow_html=True)
 
@@ -1458,30 +1314,6 @@ def render_broadcasts():
     broadcasts = get_recent_broadcasts(limit=3)
     for b in broadcasts:
         st.info(f"📢 {b['message']}")
-
-
-def render_shop_broadcasts(shop_id):
-    """Shows the shop admin's own offers/updates — customers of that shop only."""
-    broadcasts = get_shop_broadcasts(shop_id, limit=3)
-    for b in broadcasts:
-        st.info(f"🏪 {b['message']}")
-
-
-def render_low_stock_alerts(shop_id):
-    """Blinking home-display alert for any product at/under its low-stock
-    threshold. Built as single-line HTML (no newlines) — a multi-line
-    indented f-string here previously broke Markdown parsing (see banner fix)."""
-    low_items = get_low_stock_products(shop_id)
-    if not low_items:
-        return
-    for p in low_items:
-        html = (
-            '<div class="stock-alert-box">'
-            f'⚠️ <b>{p["name"]}</b> کا اسٹاک ختم ہونے والا ہے — موجودہ: {p["stock_qty"]:.1f}{p["unit"]} '
-            f'(حد: {p["low_stock_threshold"]:.1f}{p["unit"]})'
-            '</div>'
-        )
-        st.markdown(html, unsafe_allow_html=True)
 
 
 # ----------------------------- LICENSE LOCK SCREEN -----------------------------
@@ -2011,12 +1843,10 @@ def admin_panel(user):
         expiry = shop.get("license_expires_at") or shop.get("trial_end_date")
         st.caption(f"{badge} — {shop['name']}" + (f" — میعاد: {format_ts(expiry)}" if expiry else ""))
 
-    render_low_stock_alerts(shop_id)
-
     tabs = st.tabs([
-        "📡 لائیو ٹریکنگ", "🛒 اضافی آرڈرز", "🧀 پروڈکٹس / ریٹس", "📦 اسٹاک", "👥 کسٹمرز", "🛵 رائیڈرز",
+        "📡 لائیو ٹریکنگ", "🛒 اضافی آرڈرز", "🧀 پروڈکٹس / ریٹس", "👥 کسٹمرز", "🛵 رائیڈرز",
         "📒 کھاتہ / لیجر", "💵 وصولی درج کریں", "🧾 کیش سیٹلمنٹ", "🔑 پاسورڈز", "🎨 برانڈنگ",
-        "🧾 کاؤنٹر سیل (POS)", "🐄 باڑا / فارم", "📢 کسٹمر اعلان"
+        "🧾 کاؤنٹر سیل (POS)", "🐄 باڑا / فارم"
     ])
 
     # ---- Live tracking + admin notifications ----
@@ -2110,15 +1940,12 @@ def admin_panel(user):
             p_name = st.text_input("پروڈکٹ کا نام (مثلاً پینیر، کھویا)")
             p_unit = st.selectbox("یونٹ", ["kg", "liter", "packet", "piece", "dozen"])
             p_rate = st.number_input("ریٹ (Rs فی یونٹ)", min_value=0.0, value=100.0, step=10.0)
-            p_threshold = st.number_input("منیمم اسٹاک حد (لو اسٹاک الرٹ کے لیے)", min_value=0.0, value=0.0, step=1.0)
-            p_image = st.file_uploader("پروڈکٹ کی تصویر (PNG، اختیاری)", type=["png"], key="new_product_image")
             submitted = st.form_submit_button("شامل کریں")
             if submitted:
                 if not p_name:
                     st.error("پروڈکٹ کا نام درج کریں۔")
                 else:
-                    img_b64 = base64.b64encode(p_image.getvalue()).decode() if p_image else None
-                    add_product(shop_id, p_name, p_unit, p_rate, p_threshold, img_b64)
+                    add_product(shop_id, p_name, p_unit, p_rate)
                     st.success(f"پروڈکٹ '{p_name}' شامل ہو گیا۔")
                     st.rerun()
 
@@ -2127,65 +1954,19 @@ def admin_panel(user):
         all_products = get_products(shop_id, active_only=False)
         for p in all_products:
             with st.expander(f"{'⭐ ' if p['is_default_quota_item'] else ''}{p['name']} — Rs {p['rate']:.0f}/{p['unit']}"):
-                if p.get("image_base64"):
-                    st.image(base64.b64decode(p["image_base64"]), width=80)
                 with st.form(f"edit_product_{p['id']}"):
                     e_name = st.text_input("نام", value=p["name"], key=f"pname_{p['id']}")
                     unit_opts = ["kg", "liter", "packet", "piece", "dozen"]
                     e_unit = st.selectbox("یونٹ", unit_opts, index=unit_opts.index(p["unit"]) if p["unit"] in unit_opts else 0, key=f"punit_{p['id']}")
                     e_rate = st.number_input("ریٹ", min_value=0.0, value=float(p["rate"]), step=10.0, key=f"prate_{p['id']}")
-                    e_threshold = st.number_input("منیمم اسٹاک حد", min_value=0.0, value=float(p.get("low_stock_threshold") or 0), step=1.0, key=f"pthresh_{p['id']}")
                     e_active = st.checkbox("فعال (Active)", value=bool(p["active"]), key=f"pactive_{p['id']}")
-                    e_image = st.file_uploader("نئی تصویر اپلوڈ کریں (اختیاری)", type=["png"], key=f"pimg_{p['id']}")
                     if st.form_submit_button("محفوظ کریں"):
-                        new_img_b64 = base64.b64encode(e_image.getvalue()).decode() if e_image else p.get("image_base64")
-                        update_product(p["id"], shop_id, e_name, e_unit, e_rate, e_active, e_threshold, new_img_b64)
+                        update_product(p["id"], shop_id, e_name, e_unit, e_rate, e_active)
                         st.success("اپڈیٹ ہو گیا — رائیڈر اور کسٹمر پینل پر فوراً اثر ہوگا۔")
                         st.rerun()
 
-    # ---- Stock / Inventory ----
-    with tabs[3]:
-        st.subheader("📦 اسٹاک / انوینٹری")
-        st.caption("POS سیل اور مکمل ہونے والی ڈیلیوریز پر اسٹاک خودکار مائنس ہوتا ہے۔ یہاں سے دستی طور پر پلس/مائنس بھی کر سکتے ہیں۔")
-        stock_products = get_products(shop_id, active_only=False)
-        if stock_products:
-            display_rows = [{
-                "پروڈکٹ": p["name"], "موجودہ اسٹاک": f"{p['stock_qty']:.1f}{p['unit']}",
-                "لو اسٹاک حد": f"{p['low_stock_threshold']:.1f}{p['unit']}" if p["low_stock_threshold"] else "—",
-            } for p in stock_products]
-            st.dataframe(pd.DataFrame(display_rows), use_container_width=True, hide_index=True)
-
-            st.divider()
-            st.subheader("دستی اسٹاک ایڈجسٹمنٹ")
-            names = [f"{p['name']} (موجودہ: {p['stock_qty']:.1f}{p['unit']})" for p in stock_products]
-            sel = st.selectbox("پروڈکٹ منتخب کریں", range(len(names)), format_func=lambda i: names[i])
-            sel_product = stock_products[sel]
-            col1, col2 = st.columns(2)
-            adj_qty = col1.number_input("مقدار", min_value=0.0, value=1.0, step=1.0, key="stock_adj_qty")
-            adj_note = col2.text_input("نوٹ (اختیاری)", key="stock_adj_note")
-            colA, colB = st.columns(2)
-            if colA.button("➕ اسٹاک شامل کریں (Restock)", use_container_width=True):
-                adjust_stock(sel_product["id"], adj_qty, adj_note or "دستی اضافہ")
-                st.success(f"{adj_qty}{sel_product['unit']} اسٹاک میں شامل ہو گیا۔")
-                st.rerun()
-            if colB.button("➖ اسٹاک کم کریں", use_container_width=True):
-                adjust_stock(sel_product["id"], -adj_qty, adj_note or "دستی کمی")
-                st.success(f"{adj_qty}{sel_product['unit']} اسٹاک سے کم ہو گیا۔")
-                st.rerun()
-
-            st.divider()
-            st.subheader("حالیہ اسٹاک لاگ")
-            log_rows = get_stock_log(sel_product["id"])
-            if log_rows:
-                display_log = [{"وقت": format_ts(r["timestamp"]), "تبدیلی": r["delta"], "نوٹ": r["note"] or "—"} for r in log_rows]
-                st.dataframe(pd.DataFrame(display_log), use_container_width=True, hide_index=True)
-            else:
-                st.caption("اس پروڈکٹ کے لیے ابھی کوئی اسٹاک لاگ نہیں۔")
-        else:
-            st.caption("پہلے پروڈکٹس شامل کریں۔")
-
     # ---- Customers ----
-    with tabs[4]:
+    with tabs[3]:
         st.subheader("نیا کسٹمر شامل کریں")
         with st.form("add_customer"):
             c_name = st.text_input("نام")
@@ -2249,7 +2030,7 @@ def admin_panel(user):
             st.caption("ابھی کوئی کسٹمر شامل نہیں کیا گیا۔")
 
     # ---- Riders ----
-    with tabs[5]:
+    with tabs[4]:
         st.subheader("نیا رائیڈر شامل کریں")
         with st.form("add_rider"):
             r_name = st.text_input("نام", key="r_name")
@@ -2286,7 +2067,7 @@ def admin_panel(user):
             st.dataframe(pd.DataFrame([dict(r) for r in riders])[["name", "phone"]], hide_index=True, use_container_width=True)
 
     # ---- Ledger ----
-    with tabs[6]:
+    with tabs[5]:
         st.subheader("ماہانہ کھاتہ / لیجر")
         customers = get_customers(shop_id)
         if customers:
@@ -2334,7 +2115,7 @@ def admin_panel(user):
             st.caption("پہلے کسٹمر شامل کریں۔")
 
     # ---- Record payment ----
-    with tabs[7]:
+    with tabs[6]:
         st.subheader("وصولی درج کریں")
         customers = get_customers(shop_id)
         if customers:
@@ -2362,7 +2143,7 @@ def admin_panel(user):
             st.caption("پہلے کسٹمر شامل کریں۔")
 
     # ---- Cash Settlement / Recovery ----
-    with tabs[8]:
+    with tabs[7]:
         st.subheader("🧾 رائیڈرز کی نقدی (Cash in Hand)")
         conn = get_conn()
         riders = [dict(r) for r in conn.execute("SELECT * FROM riders WHERE active=1 AND shop_id=?", (shop_id,)).fetchall()]
@@ -2416,9 +2197,7 @@ def admin_panel(user):
             st.caption("پہلے رائیڈر شامل کریں۔")
 
     # ---- Password reset ----
-    with tabs[9]:
-        render_change_own_password(user)
-        st.divider()
+    with tabs[8]:
         st.subheader("🔑 کسی بھی یوزر کا پاسورڈ ری سیٹ کریں")
         conn = get_conn()
         login_users = conn.execute(
@@ -2465,7 +2244,7 @@ def admin_panel(user):
             st.caption("ابھی کوئی رائیڈر/کسٹمر لاگ ان اکاؤنٹ موجود نہیں۔")
 
     # ---- Branding (shop admin can tweak within their own shop) ----
-    with tabs[10]:
+    with tabs[9]:
         st.subheader("🎨 برانڈنگ")
         st.caption("یہ صرف آپ کی اپنی شاپ پر لاگو ہوں گے۔")
         if shop:
@@ -2511,7 +2290,7 @@ def admin_panel(user):
                 st.rerun()
 
     # ---- Walk-in Customer / POS ----
-    with tabs[11]:
+    with tabs[10]:
         st.subheader("🧾 کاؤنٹر / واکنگ کسٹمر — فوری نقد سیل")
         if "pos_cart" not in st.session_state:
             st.session_state.pos_cart = []
@@ -2576,7 +2355,7 @@ def admin_panel(user):
             st.caption("آج ابھی تک کوئی کاؤنٹر سیل نہیں ہوئی۔")
 
     # ---- Baara / Farm milk reconciliation ----
-    with tabs[12]:
+    with tabs[11]:
         st.subheader("🐄 باڑے شامل کریں")
         with st.form("add_farm_form"):
             f_name = st.text_input("باڑے کا نام")
@@ -2658,28 +2437,6 @@ def admin_panel(user):
         else:
             st.caption("ابھی تک کوئی باڑے کی انٹری نہیں ہوئی۔")
 
-    # ---- Shop-level broadcast to own customers ----
-    with tabs[13]:
-        st.subheader("📢 اپنے کسٹمرز کو اعلان بھیجیں")
-        st.caption("یہ پیغام صرف آپ کی اپنی شاپ کے کسٹمرز کو نظر آئے گا (نئی آفرز، اپڈیٹس وغیرہ)۔")
-        msg = st.text_area("پیغام لکھیں", placeholder="مثلاً: کل عید کی چھٹی ہے، ڈیلیوری نہیں ہوگی۔")
-        if st.button("✅ کسٹمرز کو بھیجیں", type="primary"):
-            if msg.strip():
-                post_shop_broadcast(shop_id, msg.strip())
-                st.success("اعلان بھیج دیا گیا۔")
-                st.rerun()
-            else:
-                st.error("پہلے پیغام لکھیں۔")
-
-        st.divider()
-        st.subheader("پرانے اعلانات")
-        history = get_shop_broadcasts(shop_id, limit=20)
-        if history:
-            for h in history:
-                st.caption(f"[{format_ts(h['created_at'])}] {h['message']}")
-        else:
-            st.caption("ابھی تک کوئی اعلان نہیں بھیجا گیا۔")
-
 
 # ----------------------------- CUSTOMER PANEL -----------------------------
 
@@ -2694,7 +2451,6 @@ def customer_panel(user):
     cust = dict(cust)
 
     st.header(f"👤 خوش آمدید، {cust['name']}")
-    render_shop_broadcasts(shop_id)
 
     col_rate, col_qr = st.columns([2, 1])
     with col_rate:
@@ -2729,11 +2485,8 @@ def customer_panel(user):
     extra_products = [p for p in get_products(shop_id) if not p["is_default_quota_item"]]
     if extra_products:
         for p in extra_products:
-            img_col, col1, col2, col3 = st.columns([1, 2.5, 2, 1])
-            if p.get("image_base64"):
-                img_col.image(base64.b64decode(p["image_base64"]), width=50)
-            out_of_stock = p["low_stock_threshold"] > 0 and p["stock_qty"] <= 0
-            col1.write(f"**{p['name']}** — Rs {p['rate']:.0f}/{p['unit']}" + (" ⚠️ اسٹاک ختم" if out_of_stock else ""))
+            col1, col2, col3 = st.columns([3, 2, 1])
+            col1.write(f"**{p['name']}** — Rs {p['rate']:.0f}/{p['unit']}")
             qty = col2.number_input("مقدار", min_value=0.0, value=0.0, step=0.25 if p["unit"] == "kg" else 1.0, key=f"extra_qty_{p['id']}", label_visibility="collapsed")
             if col3.button("➕ شامل کریں", key=f"extra_add_{p['id']}"):
                 if qty > 0:
@@ -2836,7 +2589,7 @@ def customer_panel(user):
 
 def master_admin_panel(user):
     st.header("👑 ماسٹر ایڈمن پینل")
-    tabs = st.tabs(["🏪 شاپس", "🔑 لائسنس کیز", "📊 مانیٹرنگ", "📢 اعلان (Broadcast)", "🔑 میرا پاسورڈ"])
+    tabs = st.tabs(["🏪 شاپس", "🔑 لائسنس کیز", "📊 مانیٹرنگ", "📢 اعلان (Broadcast)"])
 
     with tabs[0]:
         st.subheader("نئی شاپ بنائیں")
@@ -2985,9 +2738,6 @@ def master_admin_panel(user):
                 st.caption(f"[{format_ts(h['created_at'])}] {h['message']}")
         else:
             st.caption("ابھی تک کوئی اعلان نہیں بھیجا گیا۔")
-
-    with tabs[4]:
-        render_change_own_password(user)
 
 
 # ----------------------------- MAIN -----------------------------
