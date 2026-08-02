@@ -1270,7 +1270,7 @@ def render_change_own_password(user):
                     st.error(msg)
 
 
-
+def force_password_change_screen(user):
     st.warning("⚠️ سیکیورٹی وجہ سے آگے بڑھنے سے پہلے پاسورڈ تبدیل کرنا لازمی ہے — یہ اکاؤنٹ ابھی تک ایک معروف/ڈیفالٹ پاسورڈ پر ہے جو اس سافٹ ویئر کی اپنی دستاویزات میں بھی لکھا ہے۔")
     new_pw = st.text_input("نیا پاسورڈ (کم از کم 6 حروف)", type="password", key="force_new_pw")
     confirm_pw = st.text_input("پاسورڈ دوبارہ لکھیں", type="password", key="force_confirm_pw")
