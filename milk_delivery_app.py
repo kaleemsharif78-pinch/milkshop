@@ -96,6 +96,22 @@ def unit_presets(unit):
     return UNIT_PRESETS.get(unit, UNIT_PRESETS["piece"])
 
 
+PKT_OFFSET = timedelta(hours=5)
+
+
+def now_local():
+    """Naive datetime representing Pakistan Standard Time (UTC+5, no DST).
+    Computed from UTC rather than the server's own local clock, so it's correct regardless
+    of the server's own configured system timezone — cloud hosts (including
+    Streamlit Community Cloud) run in UTC by default, which was causing
+    every timestamp in the app to be recorded ~5 hours behind local time."""
+    return datetime.utcnow() + PKT_OFFSET
+
+
+def today_local():
+    return now_local().date()
+
+
 def format_ts(iso_str):
     """[time] - [day] - [date]  e.g. 07:15 AM - Monday - 28 July 2026"""
     if not iso_str:
@@ -434,7 +450,7 @@ def init_db():
     has_legacy_admin = c.fetchone()["n"] > 0
 
     if no_shops_yet and has_legacy_admin:
-        now = datetime.now()
+        now = now_local()
         cur = c.execute(
             "INSERT INTO shops (name,status,license_expires_at,created_at) VALUES (?,?,?,?)",
             ("My Shop", "active", (now + timedelta(days=365)).isoformat(), now.isoformat())
@@ -456,7 +472,7 @@ def init_db():
     # if there are truly no shops and no legacy admin (fresh install), seed one demo shop + admin
     c.execute("SELECT COUNT(*) AS n FROM shops")
     if c.fetchone()["n"] == 0:
-        now = datetime.now()
+        now = now_local()
         cur = c.execute(
             "INSERT INTO shops (name,status,trial_end_date,created_at) VALUES (?,?,?,?)",
             ("Demo Shop", "trial", (now + timedelta(days=15)).isoformat(), now.isoformat())
@@ -531,7 +547,7 @@ def random_key():
 
 def create_shop(name, admin_username, admin_password, admin_name, trial_days=15):
     conn = get_conn()
-    now = datetime.now()
+    now = now_local()
     cur = conn.execute(
         "INSERT INTO shops (name,status,trial_end_date,created_at) VALUES (?,?,?,?)",
         (name, "trial", (now + timedelta(days=trial_days)).isoformat(), now.isoformat())
@@ -555,7 +571,7 @@ def generate_license_key(shop_id, duration_days=365):
     conn = get_conn()
     conn.execute(
         "INSERT INTO license_keys (shop_id,key_code,duration_days,created_at) VALUES (?,?,?,?)",
-        (shop_id, key_code, duration_days, datetime.now().isoformat())
+        (shop_id, key_code, duration_days, now_local().isoformat())
     )
     conn.commit()
     conn.close()
@@ -571,8 +587,8 @@ def activate_license_key(shop_id, key_code):
     if not row:
         conn.close()
         return False, "غلط یا پہلے سے استعمال شدہ ایکٹیویشن کی۔"
-    new_expiry = (datetime.now() + timedelta(days=row["duration_days"])).isoformat()
-    conn.execute("UPDATE license_keys SET is_used=1, used_at=? WHERE id=?", (datetime.now().isoformat(), row["id"]))
+    new_expiry = (now_local() + timedelta(days=row["duration_days"])).isoformat()
+    conn.execute("UPDATE license_keys SET is_used=1, used_at=? WHERE id=?", (now_local().isoformat(), row["id"]))
     conn.execute("UPDATE shops SET status='active', license_expires_at=? WHERE id=?", (new_expiry, shop_id))
     conn.commit()
     conn.close()
@@ -583,7 +599,7 @@ def check_shop_access(shop_id):
     shop = get_shop(shop_id)
     if not shop:
         return False, "شاپ نہیں ملی۔"
-    now = datetime.now()
+    now = now_local()
     if shop["status"] == "suspended":
         return False, "یہ اکاؤنٹ ماسٹر ایڈمن کی طرف سے معطل کیا گیا ہے۔"
     if shop["status"] == "trial":
@@ -668,7 +684,7 @@ def adjust_stock(product_id, delta, note=""):
     conn.execute("UPDATE products SET stock_qty = stock_qty + ? WHERE id=?", (delta, product_id))
     conn.execute(
         "INSERT INTO stock_log (product_id,delta,note,timestamp) VALUES (?,?,?,?)",
-        (product_id, delta, note, datetime.now().isoformat())
+        (product_id, delta, note, now_local().isoformat())
     )
     conn.commit()
     conn.close()
@@ -748,7 +764,7 @@ def push_notification(customer_id, message, shop_id, audience="customer", delive
     conn = get_conn()
     conn.execute(
         "INSERT INTO notifications (customer_id,audience,message,delivery_id,created_at,shop_id) VALUES (?,?,?,?,?,?)",
-        (customer_id, audience, message, delivery_id, datetime.now().isoformat(), shop_id)
+        (customer_id, audience, message, delivery_id, now_local().isoformat(), shop_id)
     )
     conn.commit()
     conn.close()
@@ -779,7 +795,7 @@ def post_broadcast(message):
     conn = get_conn()
     conn.execute(
         "INSERT INTO broadcast_messages (message,created_at) VALUES (?,?)",
-        (message, datetime.now().isoformat())
+        (message, now_local().isoformat())
     )
     conn.commit()
     conn.close()
@@ -800,7 +816,7 @@ def post_shop_broadcast(shop_id, message):
     conn = get_conn()
     conn.execute(
         "INSERT INTO shop_broadcasts (shop_id,message,created_at) VALUES (?,?,?)",
-        (shop_id, message, datetime.now().isoformat())
+        (shop_id, message, now_local().isoformat())
     )
     conn.commit()
     conn.close()
@@ -823,7 +839,7 @@ def record_walk_in_sale(shop_id, cart_items, payment_method="cash"):
     conn = get_conn()
     cur = conn.execute(
         "INSERT INTO walk_in_sales (shop_id,total_amount,payment_method,sale_date,timestamp) VALUES (?,?,?,?,?)",
-        (shop_id, total_amount, payment_method, date.today().isoformat(), datetime.now().isoformat())
+        (shop_id, total_amount, payment_method, today_local().isoformat(), now_local().isoformat())
     )
     sale_id = cur.lastrowid
     for it in cart_items:
@@ -900,11 +916,30 @@ def get_farms(shop_id, active_only=True):
     return [dict(r) for r in rows]
 
 
+def delete_farm(farm_id, shop_id):
+    """Hard-deletes the farm if it has no supply history (safe — e.g. an
+    accidental duplicate). If it has history, deactivates it instead so
+    past reconciliation records stay intact. Returns 'deleted' or 'deactivated'."""
+    conn = get_conn()
+    has_history = conn.execute(
+        "SELECT COUNT(*) AS n FROM farm_supply WHERE farm_id=?", (farm_id,)
+    ).fetchone()["n"] > 0
+    if has_history:
+        conn.execute("UPDATE farms SET active=0 WHERE id=? AND shop_id=?", (farm_id, shop_id))
+        result = "deactivated"
+    else:
+        conn.execute("DELETE FROM farms WHERE id=? AND shop_id=?", (farm_id, shop_id))
+        result = "deleted"
+    conn.commit()
+    conn.close()
+    return result
+
+
 def record_farm_supply(shop_id, farm_id, supply_date, quantity_kg, note=""):
     conn = get_conn()
     conn.execute(
         "INSERT INTO farm_supply (shop_id,farm_id,supply_date,quantity_kg,note,timestamp) VALUES (?,?,?,?,?,?)",
-        (shop_id, farm_id, supply_date, quantity_kg, note, datetime.now().isoformat())
+        (shop_id, farm_id, supply_date, quantity_kg, note, now_local().isoformat())
     )
     conn.commit()
     conn.close()
@@ -991,12 +1026,12 @@ def record_cash_collection(rider_id: int, customer_id, amount: float, shop_id, n
     conn = get_conn()
     conn.execute(
         "INSERT INTO cash_collections (rider_id,customer_id,amount,note,timestamp) VALUES (?,?,?,?,?)",
-        (rider_id, customer_id, amount, note, datetime.now().isoformat())
+        (rider_id, customer_id, amount, note, now_local().isoformat())
     )
     if customer_id:
         conn.execute(
             "INSERT INTO payments (customer_id,payment_date,amount,method,note,timestamp) VALUES (?,?,?,?,?,?)",
-            (customer_id, date.today().isoformat(), amount, "cash", note or "رائیڈر نے موقع پر وصول کیا", datetime.now().isoformat())
+            (customer_id, today_local().isoformat(), amount, "cash", note or "رائیڈر نے موقع پر وصول کیا", now_local().isoformat())
         )
     conn.commit()
     conn.close()
@@ -1008,7 +1043,7 @@ def settle_rider_cash(rider_id: int, amount: float, note: str = ""):
     conn = get_conn()
     conn.execute(
         "INSERT INTO cash_settlements (rider_id,amount,note,timestamp) VALUES (?,?,?,?)",
-        (rider_id, amount, note, datetime.now().isoformat())
+        (rider_id, amount, note, now_local().isoformat())
     )
     conn.commit()
     conn.close()
@@ -1026,7 +1061,7 @@ def confirm_delivery(customer_id, rider_id, cart_items, shop_id, status="deliver
     cur = conn.execute(
         "INSERT INTO delivery_txns (customer_id,rider_id,delivery_date,status,total_amount,verified_via,timestamp,shop_id) "
         "VALUES (?,?,?,?,?,?,?,?)",
-        (customer_id, rider_id, date.today().isoformat(), status, total_amount, "QR Scan", datetime.now().isoformat(), shop_id)
+        (customer_id, rider_id, today_local().isoformat(), status, total_amount, "QR Scan", now_local().isoformat(), shop_id)
     )
     txn_id = cur.lastrowid
     for it in cart_items:
@@ -1051,7 +1086,7 @@ def mark_missed(customer_id, rider_id, shop_id):
     cur = conn.execute(
         "INSERT INTO delivery_txns (customer_id,rider_id,delivery_date,status,total_amount,verified_via,timestamp,shop_id) "
         "VALUES (?,?,?,?,?,?,?,?)",
-        (customer_id, rider_id, date.today().isoformat(), "missed", 0, "n/a", datetime.now().isoformat(), shop_id)
+        (customer_id, rider_id, today_local().isoformat(), "missed", 0, "n/a", now_local().isoformat(), shop_id)
     )
     txn_id = cur.lastrowid
     conn.commit()
@@ -1100,7 +1135,7 @@ def place_extra_order(shop_id, customer_id, cart_items):
     conn = get_conn()
     cur = conn.execute(
         "INSERT INTO extra_orders (shop_id,customer_id,status,total_amount,order_date,timestamp) VALUES (?,?,?,?,?,?)",
-        (shop_id, customer_id, "pending", total_amount, date.today().isoformat(), datetime.now().isoformat())
+        (shop_id, customer_id, "pending", total_amount, today_local().isoformat(), now_local().isoformat())
     )
     order_id = cur.lastrowid
     for it in cart_items:
@@ -1168,7 +1203,7 @@ def check_login_lock(username):
     conn = get_conn()
     row = conn.execute("SELECT * FROM login_attempts WHERE username=?", (username,)).fetchone()
     conn.close()
-    if row and row["locked_until"] and datetime.fromisoformat(row["locked_until"]) > datetime.now():
+    if row and row["locked_until"] and datetime.fromisoformat(row["locked_until"]) > now_local():
         return True, row["locked_until"]
     return False, None
 
@@ -1178,7 +1213,7 @@ def register_failed_login(username):
     row = conn.execute("SELECT * FROM login_attempts WHERE username=?", (username,)).fetchone()
     if row:
         new_count = row["fail_count"] + 1
-        locked_until = (datetime.now() + timedelta(minutes=LOGIN_LOCKOUT_MINUTES)).isoformat() if new_count >= LOGIN_MAX_ATTEMPTS else None
+        locked_until = (now_local() + timedelta(minutes=LOGIN_LOCKOUT_MINUTES)).isoformat() if new_count >= LOGIN_MAX_ATTEMPTS else None
         conn.execute("UPDATE login_attempts SET fail_count=?, locked_until=? WHERE username=?", (new_count, locked_until, username))
     else:
         conn.execute("INSERT INTO login_attempts (username,fail_count,locked_until) VALUES (?,?,?)", (username, 1, None))
@@ -1311,11 +1346,70 @@ def get_customers(shop_id, active_only=True):
     return [dict(r) for r in rows]
 
 
+def delete_customer(customer_id, shop_id):
+    """Hard-deletes the customer (and their login account) if they have no
+    transaction/payment/order history — safe for accidental duplicates.
+    Otherwise deactivates them so the khata history stays intact.
+    Returns 'deleted' or 'deactivated'."""
+    conn = get_conn()
+    counts = conn.execute(
+        "SELECT "
+        "(SELECT COUNT(*) FROM delivery_txns WHERE customer_id=?) + "
+        "(SELECT COUNT(*) FROM payments WHERE customer_id=?) + "
+        "(SELECT COUNT(*) FROM extra_orders WHERE customer_id=?) AS n",
+        (customer_id, customer_id, customer_id)
+    ).fetchone()["n"]
+    if counts > 0:
+        conn.execute("UPDATE customers SET active=0 WHERE id=? AND shop_id=?", (customer_id, shop_id))
+        row = conn.execute("SELECT user_id FROM customers WHERE id=?", (customer_id,)).fetchone()
+        if row and row["user_id"]:
+            conn.execute("UPDATE users SET active=0 WHERE id=?", (row["user_id"],))
+        result = "deactivated"
+    else:
+        row = conn.execute("SELECT user_id FROM customers WHERE id=? AND shop_id=?", (customer_id, shop_id)).fetchone()
+        conn.execute("DELETE FROM customers WHERE id=? AND shop_id=?", (customer_id, shop_id))
+        if row and row["user_id"]:
+            conn.execute("DELETE FROM users WHERE id=?", (row["user_id"],))
+        result = "deleted"
+    conn.commit()
+    conn.close()
+    return result
+
+
 def get_rider_by_user(user_id):
     conn = get_conn()
     row = conn.execute("SELECT * FROM riders WHERE user_id=?", (user_id,)).fetchone()
     conn.close()
     return dict(row) if row else None
+
+
+def delete_rider(rider_id, shop_id):
+    """Hard-deletes the rider (and login account) if they have no delivery
+    or cash history. Otherwise deactivates them so past records stay intact.
+    Returns 'deleted' or 'deactivated'."""
+    conn = get_conn()
+    counts = conn.execute(
+        "SELECT "
+        "(SELECT COUNT(*) FROM delivery_txns WHERE rider_id=?) + "
+        "(SELECT COUNT(*) FROM cash_collections WHERE rider_id=?) + "
+        "(SELECT COUNT(*) FROM cash_settlements WHERE rider_id=?) AS n",
+        (rider_id, rider_id, rider_id)
+    ).fetchone()["n"]
+    if counts > 0:
+        conn.execute("UPDATE riders SET active=0 WHERE id=? AND shop_id=?", (rider_id, shop_id))
+        row = conn.execute("SELECT user_id FROM riders WHERE id=?", (rider_id,)).fetchone()
+        if row and row["user_id"]:
+            conn.execute("UPDATE users SET active=0 WHERE id=?", (row["user_id"],))
+        result = "deactivated"
+    else:
+        row = conn.execute("SELECT user_id FROM riders WHERE id=? AND shop_id=?", (rider_id, shop_id)).fetchone()
+        conn.execute("DELETE FROM riders WHERE id=? AND shop_id=?", (rider_id, shop_id))
+        if row and row["user_id"]:
+            conn.execute("DELETE FROM users WHERE id=?", (row["user_id"],))
+        result = "deleted"
+    conn.commit()
+    conn.close()
+    return result
 
 
 def customer_balance(customer_id):
@@ -1771,7 +1865,7 @@ def render_thermal_receipt(shop, title, item_rows, total_amount, ref_label, pape
         f'<tr><td class="item">{r["name"]}</td><td class="qty">{r["qty"]}</td><td class="amt">{r["amount"]:.0f}</td></tr>'
         for r in item_rows
     )
-    now_label = format_ts(datetime.now().isoformat())
+    now_label = format_ts(now_local().isoformat())
     footer_note = extra_note or "شکریہ! دوبارہ تشریف لائیں۔"
 
     html = (
@@ -1967,7 +2061,7 @@ def rider_panel(user):
 
         st.divider()
         st.subheader("آج کی کیش کلیکشن ہسٹری")
-        today = date.today().isoformat()
+        today = today_local().isoformat()
         conn = get_conn()
         crows = conn.execute(
             "SELECT cc.*, c.name AS customer_name FROM cash_collections cc "
@@ -1987,7 +2081,7 @@ def rider_panel(user):
             st.caption("آج ابھی تک کوئی نقد وصولی درج نہیں ہوئی۔")
 
     with tab_history:
-        today = date.today().isoformat()
+        today = today_local().isoformat()
         rows = get_transactions(shop_id, rider_id=rider["id"], date_filter=today)
         if rows:
             for r in rows:
@@ -2026,7 +2120,7 @@ def admin_panel(user):
         if col_r.button("🔄 ریفریش"):
             st.rerun()
 
-        today = date.today().isoformat()
+        today = today_local().isoformat()
         rows = get_transactions(shop_id, date_filter=today)
         if rows:
             display_rows = []
@@ -2050,7 +2144,7 @@ def admin_panel(user):
         if PDF_AVAILABLE:
             st.divider()
             st.subheader("📄 ماہانہ سمری (تمام کسٹمرز)")
-            month_for_summary = st.text_input("مہینہ (YYYY-MM)", value=date.today().strftime("%Y-%m"), key="live_month_summary")
+            month_for_summary = st.text_input("مہینہ (YYYY-MM)", value=today_local().strftime("%Y-%m"), key="live_month_summary")
             month_rows = get_transactions(shop_id, month_filter=month_for_summary)
             if month_rows:
                 monthly_all_buf = generate_delivery_summary_pdf(shop, month_rows, month_for_summary)
@@ -2245,6 +2339,24 @@ def admin_panel(user):
                     if st.button("🔄 QR دوبارہ جنریٹ کریں (پرانا invalid ہو جائے گا)", key=f"regen_{c['id']}"):
                         generate_customer_qr_token(c["id"])
                         st.rerun()
+
+                confirm_key = f"confirm_del_cust_{c['id']}"
+                if st.session_state.get(confirm_key):
+                    st.warning(f"'{c['name']}' کو پکا ڈیلیٹ کرنا ہے؟ اگر لین دین کی ہسٹری موجود ہو تو یہ صرف غیر فعال (deactivate) ہوگا۔")
+                    cc1, cc2 = st.columns(2)
+                    if cc1.button("✅ ہاں، ڈیلیٹ کریں", key=f"yes_del_cust_{c['id']}", type="primary"):
+                        result = delete_customer(c["id"], shop_id)
+                        st.session_state.pop(confirm_key, None)
+                        st.success("کسٹمر مکمل ڈیلیٹ ہو گیا۔" if result == "deleted" else "کسٹمر کی ہسٹری موجود تھی، اس لیے غیر فعال کر دیا گیا۔")
+                        st.rerun()
+                    if cc2.button("❌ منسوخ کریں", key=f"no_del_cust_{c['id']}"):
+                        st.session_state.pop(confirm_key, None)
+                        st.rerun()
+                else:
+                    if st.button("🗑️ کسٹمر ڈیلیٹ کریں", key=f"del_cust_{c['id']}"):
+                        st.session_state[confirm_key] = True
+                        st.rerun()
+                st.divider()
         else:
             st.caption("ابھی کوئی کسٹمر شامل نہیں کیا گیا۔")
 
@@ -2279,11 +2391,33 @@ def admin_panel(user):
                         conn.close()
 
         st.divider()
+        st.subheader("موجودہ رائیڈرز")
         conn = get_conn()
-        riders = conn.execute("SELECT * FROM riders WHERE active=1 AND shop_id=?", (shop_id,)).fetchall()
+        riders = [dict(r) for r in conn.execute("SELECT * FROM riders WHERE active=1 AND shop_id=?", (shop_id,)).fetchall()]
         conn.close()
         if riders:
-            st.dataframe(pd.DataFrame([dict(r) for r in riders])[["name", "phone"]], hide_index=True, use_container_width=True)
+            for r in riders:
+                col1, col2 = st.columns([4, 1])
+                col1.write(f"**{r['name']}** — {r['phone'] or ''}")
+
+                confirm_key = f"confirm_del_rider_{r['id']}"
+                if st.session_state.get(confirm_key):
+                    st.warning(f"'{r['name']}' کو پکا ڈیلیٹ کرنا ہے؟ اگر ڈیلیوری/کیش ہسٹری موجود ہو تو یہ صرف غیر فعال (deactivate) ہوگا۔")
+                    cc1, cc2 = st.columns(2)
+                    if cc1.button("✅ ہاں، ڈیلیٹ کریں", key=f"yes_del_rider_{r['id']}", type="primary"):
+                        result = delete_rider(r["id"], shop_id)
+                        st.session_state.pop(confirm_key, None)
+                        st.success("رائیڈر مکمل ڈیلیٹ ہو گیا۔" if result == "deleted" else "رائیڈر کی ہسٹری موجود تھی، اس لیے غیر فعال کر دیا گیا۔")
+                        st.rerun()
+                    if cc2.button("❌ منسوخ کریں", key=f"no_del_rider_{r['id']}"):
+                        st.session_state.pop(confirm_key, None)
+                        st.rerun()
+                else:
+                    if col2.button("🗑️ ڈیلیٹ", key=f"del_rider_{r['id']}"):
+                        st.session_state[confirm_key] = True
+                        st.rerun()
+        else:
+            st.caption("ابھی کوئی رائیڈر شامل نہیں کیا گیا۔")
 
     # ---- Ledger ----
     with tabs[6]:
@@ -2294,7 +2428,7 @@ def admin_panel(user):
             sel = st.selectbox("کسٹمر منتخب کریں", range(len(names)), format_func=lambda i: names[i])
             cust = customers[sel]
 
-            month = st.text_input("مہینہ (YYYY-MM)", value=date.today().strftime("%Y-%m"))
+            month = st.text_input("مہینہ (YYYY-MM)", value=today_local().strftime("%Y-%m"))
             rows = get_transactions(shop_id, customer_id=cust["id"], month_filter=month)
             conn = get_conn()
             pay_rows = conn.execute(
@@ -2351,7 +2485,7 @@ def admin_panel(user):
                     conn = get_conn()
                     conn.execute(
                         "INSERT INTO payments (customer_id,payment_date,amount,method,note,timestamp) VALUES (?,?,?,?,?,?)",
-                        (cust["id"], date.today().isoformat(), amt, method, note, datetime.now().isoformat())
+                        (cust["id"], today_local().isoformat(), amt, method, note, now_local().isoformat())
                     )
                     conn.commit()
                     conn.close()
@@ -2563,7 +2697,7 @@ def admin_panel(user):
 
         st.divider()
         st.subheader("📋 آج کی کاؤنٹر سیلز")
-        today = date.today().isoformat()
+        today = today_local().isoformat()
         today_sales = get_walk_in_sales(shop_id, date_filter=today)
         if today_sales:
             display_rows = [{"وقت": format_ts(s["timestamp"]), "آئٹمز": s["items_summary"] or "—", "رقم": s["total_amount"], "طریقہ": s["payment_method"]} for s in today_sales]
@@ -2607,6 +2741,24 @@ def admin_panel(user):
                             update_farm(f["id"], shop_id, e_name, e_owner, e_phone, e_address, e_active)
                             st.success("باڑے کی تفصیل اپڈیٹ ہو گئی۔")
                             st.rerun()
+
+                    st.divider()
+                    confirm_key = f"confirm_del_farm_{f['id']}"
+                    if st.session_state.get(confirm_key):
+                        st.warning("پکا ڈیلیٹ کرنا ہے؟ اگر اس باڑے کی سپلائی ہسٹری موجود ہو تو یہ صرف غیر فعال (deactivate) ہوگا۔")
+                        cc1, cc2 = st.columns(2)
+                        if cc1.button("✅ ہاں، ڈیلیٹ کریں", key=f"yes_del_farm_{f['id']}", type="primary"):
+                            result = delete_farm(f["id"], shop_id)
+                            st.session_state.pop(confirm_key, None)
+                            st.success("باڑہ مکمل ڈیلیٹ ہو گیا۔" if result == "deleted" else "باڑے کی ہسٹری موجود تھی، اس لیے غیر فعال کر دیا گیا۔")
+                            st.rerun()
+                        if cc2.button("❌ منسوخ کریں", key=f"no_del_farm_{f['id']}"):
+                            st.session_state.pop(confirm_key, None)
+                            st.rerun()
+                    else:
+                        if st.button("🗑️ باڑہ ڈیلیٹ کریں", key=f"del_farm_{f['id']}"):
+                            st.session_state[confirm_key] = True
+                            st.rerun()
         else:
             st.caption("ابھی کوئی باڑہ شامل نہیں کیا گیا۔")
 
@@ -2616,7 +2768,7 @@ def admin_panel(user):
             with st.form("farm_supply_form"):
                 farm_names = [f["name"] for f in farms]
                 sel_farm = st.selectbox("باڑہ منتخب کریں", range(len(farm_names)), format_func=lambda i: farm_names[i])
-                supply_date = st.date_input("تاریخ", value=date.today())
+                supply_date = st.date_input("تاریخ", value=today_local())
                 qty_kg = st.number_input("دودھ کی مقدار (kg)", min_value=0.0, step=1.0)
                 note = st.text_input("نوٹ (اختیاری)")
                 if st.form_submit_button("✅ درج کریں", type="primary"):
@@ -2631,7 +2783,7 @@ def admin_panel(user):
 
         st.divider()
         st.subheader("📊 روزانہ حساب کا تقابل (Reconciliation)")
-        recon_date = st.date_input("تاریخ منتخب کریں", value=date.today(), key="recon_date")
+        recon_date = st.date_input("تاریخ منتخب کریں", value=today_local(), key="recon_date")
         recon = get_daily_reconciliation(shop_id, recon_date.isoformat())
         if recon["milk_product"]:
             m1, m2, m3, m4 = st.columns(4)
@@ -2776,7 +2928,7 @@ def customer_panel(user):
                 pdf_buf = generate_extra_order_receipt_pdf(shop_for_pdf, cust, o, items)
                 col2.download_button("📄 رسید", data=pdf_buf, file_name=f"receipt_{o['id']}.pdf", mime="application/pdf", key=f"receipt_dl_{o['id']}")
 
-    month = date.today().strftime("%Y-%m")
+    month = today_local().strftime("%Y-%m")
     rows = get_transactions(shop_id, customer_id=cust["id"], month_filter=month)
     conn = get_conn()
     pay_rows = conn.execute(
@@ -2881,7 +3033,7 @@ def master_admin_panel(user):
                     conn = get_conn()
                     conn.execute(
                         "UPDATE shops SET status='active', license_expires_at=? WHERE id=?",
-                        ((datetime.now() + timedelta(days=365)).isoformat(), s["id"])
+                        ((now_local() + timedelta(days=365)).isoformat(), s["id"])
                     )
                     conn.commit()
                     conn.close()
@@ -2924,7 +3076,7 @@ def master_admin_panel(user):
 
     with tabs[2]:
         st.subheader("📊 تمام شاپس کی آج کی ڈیلیوریز")
-        today = date.today().isoformat()
+        today = today_local().isoformat()
         conn = get_conn()
         rows = conn.execute(
             "SELECT dt.*, s.name AS shop_name, c.name AS customer_name, r.name AS rider_name, "
