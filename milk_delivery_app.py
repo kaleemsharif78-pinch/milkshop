@@ -1257,6 +1257,43 @@ def reset_user_password(user_id, new_password):
     conn.close()
 
 
+def get_recovery_key():
+    """The recovery key lives OUTSIDE the source code — in Streamlit secrets
+    (or an environment variable as a fallback) — never hardcoded here, so it
+    stays safe even if the GitHub repo is public. Set it once via:
+    Streamlit Cloud → your app → Settings → Secrets:
+        MASTER_RECOVERY_KEY = "some-long-random-string-only-you-know"
+    """
+    try:
+        if "MASTER_RECOVERY_KEY" in st.secrets:
+            return st.secrets["MASTER_RECOVERY_KEY"]
+    except Exception:
+        pass
+    return os.environ.get("MASTER_RECOVERY_KEY")
+
+
+def recover_master_admin(recovery_key_input):
+    """Resets the Master Admin's password AND clears any login lockout,
+    using a secret only the developer knows — no database access needed."""
+    configured_key = get_recovery_key()
+    if not configured_key:
+        return False, "Recovery key ابھی سیٹ نہیں ہے۔ Streamlit Cloud پر Settings → Secrets میں MASTER_RECOVERY_KEY شامل کریں۔"
+    if not recovery_key_input or recovery_key_input != configured_key:
+        return False, "غلط Recovery Key۔"
+
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM users WHERE role='master_admin'").fetchone()
+    if not row:
+        conn.close()
+        return False, "کوئی Master Admin اکاؤنٹ نہیں ملا۔"
+    new_pw = random_password(10)
+    conn.execute("UPDATE users SET password=?, active=1 WHERE id=?", (hash_pw(new_pw), row["id"]))
+    conn.execute("DELETE FROM login_attempts WHERE username=?", (row["username"],))
+    conn.commit()
+    conn.close()
+    return True, new_pw
+
+
 def login_page():
     with st.form("login_form"):
         username = st.text_input("Username")
@@ -1276,6 +1313,16 @@ def login_page():
                 else:
                     register_failed_login(uname)
                     st.error("غلط یوزرنیم یا پاسورڈ")
+
+    with st.expander("🆘 Master Admin لاگ ان نہیں ہو رہا؟ (Recovery)"):
+        st.caption("یہ صرف ڈیولپر/مالک کے لیے ہے جس کے پاس خفیہ Recovery Key موجود ہو۔ عام صارفین کے لیے نہیں۔")
+        rk = st.text_input("Recovery Key", type="password", key="master_recovery_key_input")
+        if st.button("🔑 Master Admin پاسورڈ ری سیٹ کریں"):
+            ok, result = recover_master_admin(rk)
+            if ok:
+                st.success(f"✅ نیا پاسورڈ: **{result}** — ابھی اسی سے لاگ ان کریں اور فوراً اپنا پاسورڈ تبدیل کر لیں۔")
+            else:
+                st.error(result)
 
 
 def change_own_password(user, current_password, new_password):
