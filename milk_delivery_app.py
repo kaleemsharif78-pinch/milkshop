@@ -44,7 +44,7 @@ try:
     from reportlab.lib.pagesizes import A4
     from reportlab.lib import colors
     from reportlab.lib.units import mm
-    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image
     from reportlab.lib.styles import ParagraphStyle
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
@@ -91,9 +91,123 @@ DEFAULT_PRODUCTS = [
     ("ملائی (Fresh Cream)", "kg", 600.0, 0),
 ]
 
+# New shops start on this pastel-purple palette (the existing "🎨 برانڈنگ" theme
+# changer is untouched — any shop can still pick its own colors any time).
+DEFAULT_SHOP_THEME = {
+    "primary_color": "#7C6FE0",
+    "accent_color": "#B8A6F0",
+    "secondary_color": "#F3F1FC",
+    "background_color": "#FFFFFF",
+    "text_color": "#241F3A",
+}
+
 
 def unit_presets(unit):
     return UNIT_PRESETS.get(unit, UNIT_PRESETS["piece"])
+
+
+# ----------------------------- ASSETS (NABA Tech logo / intro video) -----------------------------
+
+_ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+_LOGO_PATH = os.path.join(_ASSETS_DIR, "naba_logo.png")
+_INTRO_VIDEO_PATH = os.path.join(_ASSETS_DIR, "naba_intro.mp4")
+_logo_b64_cache = None
+
+
+def get_naba_logo_base64():
+    """Loads assets/naba_logo.png once and caches it in memory. Returns None
+    if the file isn't shipped alongside the script (callers should fall back
+    to text/emoji in that case, never crash)."""
+    global _logo_b64_cache
+    if _logo_b64_cache is not None:
+        return _logo_b64_cache
+    try:
+        with open(_LOGO_PATH, "rb") as f:
+            _logo_b64_cache = base64.b64encode(f.read()).decode()
+    except Exception:
+        _logo_b64_cache = ""
+    return _logo_b64_cache or None
+
+
+def intro_video_exists():
+    return os.path.exists(_INTRO_VIDEO_PATH)
+
+
+# ----------------------------- LANGUAGE / TRANSLATION -----------------------------
+# Lightweight i18n: a translation table for the app's core navigation and
+# high-visibility labels (login, banner, sidebar, main tab names). Long-form
+# help text and captions stay Urdu-only for now — translating every string
+# in the app is a much larger follow-up task; t() always falls back to the
+# Urdu key itself so nothing ever breaks or shows blank.
+
+TRANSLATIONS = {
+    "Username": "یوزرنیم",
+    "Password": "پاسورڈ",
+    "Login": "لاگ ان",
+    "Logout": "لاگ آؤٹ",
+    "Save": "محفوظ کریں",
+    "Cancel": "منسوخ کریں",
+    "Delete": "ڈیلیٹ کریں",
+    "Confirm": "تصدیق کریں",
+    "Add": "شامل کریں",
+    "Edit": "ترمیم کریں",
+    "Owner / Admin Dashboard": "اونر / ایڈمن ڈیش بورڈ",
+    "Rider Panel": "رائیڈر پینل",
+    "Welcome": "خوش آمدید",
+    "Live Tracking": "لائیو ٹریکنگ",
+    "Extra Orders": "اضافی آرڈرز",
+    "Products / Rates": "پروڈکٹس / ریٹس",
+    "Stock": "اسٹاک",
+    "Customers": "کسٹمرز",
+    "Riders": "رائیڈرز",
+    "Ledger": "کھاتہ / لیجر",
+    "Record Payment": "وصولی درج کریں",
+    "Cash Settlement": "کیش سیٹلمنٹ",
+    "Passwords": "پاسورڈز",
+    "Branding": "برانڈنگ",
+    "Counter Sale (POS)": "کاؤنٹر سیل (POS)",
+    "Baara / Farm": "باڑا / فارم",
+    "Customer Broadcast": "کسٹمر اعلان",
+    "Today's Rate": "آج کا ریٹ",
+    "Your QR Code": "آپ کا QR کوڈ",
+    "This Month's Bill": "اس مہینے کل بل",
+    "Amount Received": "جمع کروائی رقم",
+    "Balance Due": "باقی بقیہ",
+    "Notifications": "نوٹیفکیشنز",
+    "Scan QR": "QR اسکین کریں",
+    "Confirm Delivery": "Confirm Delivery",
+    "Cash in Hand": "آپ کے پاس موجود نقدی (Cash in Hand)",
+    "Master Admin Panel": "ماسٹر ایڈمن پینل",
+    "Shops": "شاپس",
+    "License Keys": "لائسنس کیز",
+    "Monitoring": "مانیٹرنگ",
+    "Broadcast": "اعلان (Broadcast)",
+    "My Password": "میرا پاسورڈ",
+}
+TRANSLATIONS_REVERSE = {v: k for k, v in TRANSLATIONS.items()}
+
+
+def get_lang():
+    return st.session_state.get("lang", "ur")
+
+
+def t(text):
+    """Translate a string according to the current session language.
+    text is always given in Urdu (the app's native strings); when the
+    session language is English, look up the English equivalent — if none
+    is registered yet, the original Urdu text is returned unchanged so nothing
+    ever breaks."""
+    if get_lang() == "en":
+        return TRANSLATIONS_REVERSE.get(text, text)
+    return text
+
+
+def render_language_toggle():
+    current = get_lang()
+    label = "English" if current == "ur" else "اردو"
+    if st.button(f"🌐 {label}", key="lang_toggle_btn", use_container_width=True):
+        st.session_state.lang = "en" if current == "ur" else "ur"
+        st.rerun()
 
 
 PKT_OFFSET = timedelta(hours=5)
@@ -474,8 +588,11 @@ def init_db():
     if c.fetchone()["n"] == 0:
         now = now_local()
         cur = c.execute(
-            "INSERT INTO shops (name,status,trial_end_date,created_at) VALUES (?,?,?,?)",
-            ("Demo Shop", "trial", (now + timedelta(days=15)).isoformat(), now.isoformat())
+            "INSERT INTO shops (name,status,trial_end_date,created_at,primary_color,accent_color,secondary_color,background_color,text_color) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            ("Demo Shop", "trial", (now + timedelta(days=15)).isoformat(), now.isoformat(),
+             DEFAULT_SHOP_THEME["primary_color"], DEFAULT_SHOP_THEME["accent_color"], DEFAULT_SHOP_THEME["secondary_color"],
+             DEFAULT_SHOP_THEME["background_color"], DEFAULT_SHOP_THEME["text_color"])
         )
         demo_shop_id = cur.lastrowid
         c.execute(
@@ -549,8 +666,11 @@ def create_shop(name, admin_username, admin_password, admin_name, trial_days=15)
     conn = get_conn()
     now = now_local()
     cur = conn.execute(
-        "INSERT INTO shops (name,status,trial_end_date,created_at) VALUES (?,?,?,?)",
-        (name, "trial", (now + timedelta(days=trial_days)).isoformat(), now.isoformat())
+        "INSERT INTO shops (name,status,trial_end_date,created_at,primary_color,accent_color,secondary_color,background_color,text_color) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (name, "trial", (now + timedelta(days=trial_days)).isoformat(), now.isoformat(),
+         DEFAULT_SHOP_THEME["primary_color"], DEFAULT_SHOP_THEME["accent_color"], DEFAULT_SHOP_THEME["secondary_color"],
+         DEFAULT_SHOP_THEME["background_color"], DEFAULT_SHOP_THEME["text_color"])
     )
     shop_id = cur.lastrowid
     conn.execute(
@@ -1295,10 +1415,14 @@ def recover_master_admin(recovery_key_input):
 
 
 def login_page():
+    col_lang, _ = st.columns([1, 3])
+    with col_lang:
+        render_language_toggle()
+
     with st.form("login_form"):
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Login", use_container_width=True)
+        username = st.text_input(t("Username"))
+        password = st.text_input(t("Password"), type="password")
+        submitted = st.form_submit_button(t("Login"), use_container_width=True)
         if submitted:
             uname = username.strip()
             locked, until = check_login_lock(uname)
@@ -1374,7 +1498,8 @@ def logout_button():
     with st.sidebar:
         st.markdown(f"**{st.session_state.user['name']}**")
         st.caption(st.session_state.user['role'].upper())
-        if st.button("Logout", use_container_width=True):
+        render_language_toggle()
+        if st.button(t("Logout"), use_container_width=True):
             del st.session_state.user
             st.rerun()
 
@@ -1476,11 +1601,11 @@ def customer_balance(customer_id):
 # ----------------------------- THEME / BRANDING -----------------------------
 
 def apply_theme(shop=None):
-    primary = (shop.get("primary_color") if shop else None) or "#3B6EA5"
-    bg = (shop.get("background_color") if shop else None) or "#FFFFFF"
-    text_color = (shop.get("text_color") if shop else None) or "#1F2A37"
-    secondary = (shop.get("secondary_color") if shop else None) or "#F1F3F5"
-    accent = (shop.get("accent_color") if shop else None) or "#5B8FC4"
+    primary = (shop.get("primary_color") if shop else None) or DEFAULT_SHOP_THEME["primary_color"]
+    bg = (shop.get("background_color") if shop else None) or DEFAULT_SHOP_THEME["background_color"]
+    text_color = (shop.get("text_color") if shop else None) or DEFAULT_SHOP_THEME["text_color"]
+    secondary = (shop.get("secondary_color") if shop else None) or DEFAULT_SHOP_THEME["secondary_color"]
+    accent = (shop.get("accent_color") if shop else None) or DEFAULT_SHOP_THEME["accent_color"]
     st.markdown(f"""
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap');
@@ -1576,6 +1701,12 @@ def render_banner(shop=None):
     logo_html = f'<img class="naba-banner-logo-img" src="data:image/png;base64,{logo_img}" />' if logo_img else f'<span style="font-size:34px;">{emoji}</span>'
     proprietor_html = f'<p class="proprietor">{proprietor}</p>' if proprietor else ""
 
+    naba_logo_b64 = get_naba_logo_base64()
+    naba_brand_html = (
+        f'<img src="data:image/png;base64,{naba_logo_b64}" style="height:15px;vertical-align:middle;border-radius:3px;margin-left:5px;" />'
+        if naba_logo_b64 else "NABA Tech"
+    )
+
     # Built as ONE unbroken line (no newlines/indentation). Streamlit's
     # st.markdown runs standard Markdown first: a blank line followed by
     # indented text gets turned into a literal code block, which broke the
@@ -1588,7 +1719,7 @@ def render_banner(shop=None):
         f'<h1>{text}</h1>'
         f'{proprietor_html}'
         '</div></div>'
-        '<p class="contact">NABA Tech | Mobile: 03151186003</p>'
+        f'<p class="contact">{naba_brand_html} | Mobile: 03151186003</p>'
         '</div>'
     )
     st.markdown(banner_html, unsafe_allow_html=True)
@@ -1716,7 +1847,7 @@ def _pcell(text, font_size=9, color="#1F2A37", bold=False):
 
 def _pdf_header(elements, shop, title):
     _ensure_urdu_fonts()
-    primary = (shop.get("primary_color") if shop else None) or "#3B6EA5"
+    primary = (shop.get("primary_color") if shop else None) or DEFAULT_SHOP_THEME["primary_color"]
     logo_text = (shop.get("logo_text") if shop else None) or "Doodh Delivery System"
 
     title_font = pick_font(logo_text, heading=True)
@@ -1728,8 +1859,18 @@ def _pdf_header(elements, shop, title):
     default_body_font = "UrduBody" if _URDU_FONTS_REGISTERED else "Helvetica"
 
     elements.append(Paragraph(ur(logo_text), title_style))
-    elements.append(Spacer(1, 6))
-    elements.append(Paragraph(ur("NABA TECH BY KALEEM ULLAH SHARIF"), sub_style))
+    elements.append(Spacer(1, 4))
+    naba_logo_b64 = get_naba_logo_base64()
+    if naba_logo_b64:
+        try:
+            logo_buf = io.BytesIO(base64.b64decode(naba_logo_b64))
+            logo_img = Image(logo_buf, width=16 * mm, height=16 * mm)
+            logo_img.hAlign = "RIGHT"
+            elements.append(logo_img)
+        except Exception:
+            elements.append(Paragraph(ur("NABA TECH BY KALEEM ULLAH SHARIF"), sub_style))
+    else:
+        elements.append(Paragraph(ur("NABA TECH BY KALEEM ULLAH SHARIF"), sub_style))
     elements.append(Spacer(1, 16))
     elements.append(Paragraph(ur(title), h2_style))
     elements.append(Spacer(1, 10))
@@ -1756,7 +1897,7 @@ def generate_invoice_pdf(shop, customer, month, transactions, total_bill, total_
         data.append([_pcell(r["status"]), _pcell(f"Rs {r['total_amount']:.0f}"), _pcell(r["items_summary"] or "—"), _pcell(format_ts(r["timestamp"]))])
     table = Table(data, colWidths=[25 * mm, 25 * mm, 60 * mm, 45 * mm])
     table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor((shop.get("primary_color") if shop else None) or "#3B6EA5")),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor((shop.get("primary_color") if shop else None) or DEFAULT_SHOP_THEME["primary_color"])),
         ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
         ("ALIGN", (0, 0), (-1, -1), "RIGHT"),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
@@ -1799,7 +1940,7 @@ def generate_extra_order_receipt_pdf(shop, customer, order, items):
         data.append([_pcell(f"Rs {it['amount']:.0f}"), _pcell(f"Rs {it['rate']:.0f}"), _pcell(f"{it['quantity']}{it['unit']}"), _pcell(it["product_name"])])
     table = Table(data, colWidths=[25 * mm, 25 * mm, 25 * mm, 80 * mm])
     table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor((shop.get("primary_color") if shop else None) or "#3B6EA5")),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor((shop.get("primary_color") if shop else None) or DEFAULT_SHOP_THEME["primary_color"])),
         ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
         ("ALIGN", (0, 0), (-1, -1), "RIGHT"),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
@@ -1834,7 +1975,7 @@ def generate_delivery_summary_pdf(shop, rows, period_label):
             total += r["total_amount"]
     table = Table(data, colWidths=[18 * mm, 20 * mm, 40 * mm, 25 * mm, 30 * mm, 38 * mm], repeatRows=1)
     table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor((shop.get("primary_color") if shop else None) or "#3B6EA5")),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor((shop.get("primary_color") if shop else None) or DEFAULT_SHOP_THEME["primary_color"])),
         ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
         ("ALIGN", (0, 0), (-1, -1), "RIGHT"),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
@@ -1866,7 +2007,7 @@ def generate_walkin_sales_pdf(shop, rows, period_label):
         total += r["total_amount"]
     table = Table(data, colWidths=[20 * mm, 25 * mm, 75 * mm, 34 * mm], repeatRows=1)
     table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor((shop.get("primary_color") if shop else None) or "#3B6EA5")),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor((shop.get("primary_color") if shop else None) or DEFAULT_SHOP_THEME["primary_color"])),
         ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
         ("ALIGN", (0, 0), (-1, -1), "RIGHT"),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
@@ -1903,7 +2044,7 @@ def render_thermal_receipt(shop, title, item_rows, total_amount, ref_label, pape
     (that would need Web Bluetooth + printer-specific command bytes)."""
     logo_text = (shop.get("logo_text") if shop else None) or "Doodh Delivery System"
     proprietor = (shop.get("proprietor_name") if shop else None) or ""
-    primary = (shop.get("primary_color") if shop else None) or "#3B6EA5"
+    primary = (shop.get("primary_color") if shop else None) or DEFAULT_SHOP_THEME["primary_color"]
 
     qr_b64 = generate_qr_base64(ref_label, box_size=3)
     qr_html = f'<div class="qr"><img src="data:image/png;base64,{qr_b64}" width="90" /></div>' if qr_b64 else ""
@@ -1914,6 +2055,11 @@ def render_thermal_receipt(shop, title, item_rows, total_amount, ref_label, pape
     )
     now_label = format_ts(now_local().isoformat())
     footer_note = extra_note or "شکریہ! دوبارہ تشریف لائیں۔"
+    naba_logo_b64 = get_naba_logo_base64()
+    naba_footer_brand = (
+        f'<img src="data:image/png;base64,{naba_logo_b64}" style="height:12px;vertical-align:middle;" />'
+        if naba_logo_b64 else "NABA Tech"
+    )
 
     html = (
         "<html><head><meta charset='utf-8'><style>"
@@ -1936,7 +2082,7 @@ def render_thermal_receipt(shop, title, item_rows, total_amount, ref_label, pape
         "<div class='line'></div>"
         f"<table><tr class='total-row'><td class='item'>کل رقم</td><td class='qty'></td><td class='amt'>Rs {total_amount:.0f}</td></tr></table>"
         f"{qr_html}"
-        f"<div class='footer'>{footer_note}<br/>NABA Tech | Mobile: 03151186003</div>"
+        f"<div class='footer'>{footer_note}<br/>{naba_footer_brand} | Mobile: 03151186003</div>"
         "</body></html>"
     )
     components.html(html, height=520, scrolling=True)
@@ -1951,7 +2097,7 @@ def rider_panel(user):
         st.error("آپ کا رائیڈر پروفائل نہیں ملا۔ ایڈمن سے رابطہ کریں۔")
         return
 
-    st.header("🛵 رائیڈر پینل")
+    st.header(f"🛵 {t('Rider Panel')}")
     products = get_products(shop_id)
     milk = get_default_quota_product(shop_id)
 
@@ -2145,7 +2291,7 @@ def rider_panel(user):
 def admin_panel(user):
     shop_id = user["shop_id"]
     shop = get_shop(shop_id)
-    st.header("🧑‍💼 اونر / ایڈمن ڈیش بورڈ")
+    st.header(f"🧑‍💼 {t('Owner / Admin Dashboard')}")
 
     if shop:
         badge = {"trial": "🟡 ٹرائل", "active": "🟢 فعال", "expired": "🔴 ختم شدہ", "suspended": "⛔ معطل"}.get(shop["status"], shop["status"])
@@ -2155,9 +2301,11 @@ def admin_panel(user):
     render_low_stock_alerts(shop_id)
 
     tabs = st.tabs([
-        "📡 لائیو ٹریکنگ", "🛒 اضافی آرڈرز", "🧀 پروڈکٹس / ریٹس", "📦 اسٹاک", "👥 کسٹمرز", "🛵 رائیڈرز",
-        "📒 کھاتہ / لیجر", "💵 وصولی درج کریں", "🧾 کیش سیٹلمنٹ", "🔑 پاسورڈز", "🎨 برانڈنگ",
-        "🧾 کاؤنٹر سیل (POS)", "🐄 باڑا / فارم", "📢 کسٹمر اعلان"
+        f"📡 {t('Live Tracking')}", f"🛒 {t('Extra Orders')}", f"🧀 {t('Products / Rates')}", f"📦 {t('Stock')}",
+        f"👥 {t('Customers')}", f"🛵 {t('Riders')}",
+        f"📒 {t('Ledger')}", f"💵 {t('Record Payment')}", f"🧾 {t('Cash Settlement')}", f"🔑 {t('Passwords')}",
+        f"🎨 {t('Branding')}",
+        f"🧾 {t('Counter Sale (POS)')}", f"🐄 {t('Baara / Farm')}", f"📢 {t('Customer Broadcast')}"
     ])
 
     # ---- Live tracking + admin notifications ----
@@ -2667,11 +2815,11 @@ def admin_panel(user):
 
             st.markdown("#### تھیم کے رنگ")
             col1, col2 = st.columns(2)
-            new_primary = col1.color_picker("پرائمری رنگ (بٹنز/بینر)", value=shop.get("primary_color") or "#3B6EA5")
-            new_accent = col2.color_picker("ایکسنٹ رنگ (بینر گریڈینٹ)", value=shop.get("accent_color") or "#5B8FC4")
-            new_bg = col1.color_picker("بیک گراؤنڈ رنگ", value=shop.get("background_color") or "#FFFFFF")
-            new_text = col2.color_picker("ٹیکسٹ رنگ", value=shop.get("text_color") or "#1F2A37")
-            new_secondary = col1.color_picker("سیکنڈری رنگ (کارڈز/سائیڈ بار)", value=shop.get("secondary_color") or "#F1F3F5")
+            new_primary = col1.color_picker("پرائمری رنگ (بٹنز/بینر)", value=shop.get("primary_color") or DEFAULT_SHOP_THEME["primary_color"])
+            new_accent = col2.color_picker("ایکسنٹ رنگ (بینر گریڈینٹ)", value=shop.get("accent_color") or DEFAULT_SHOP_THEME["accent_color"])
+            new_bg = col1.color_picker("بیک گراؤنڈ رنگ", value=shop.get("background_color") or DEFAULT_SHOP_THEME["background_color"])
+            new_text = col2.color_picker("ٹیکسٹ رنگ", value=shop.get("text_color") or DEFAULT_SHOP_THEME["text_color"])
+            new_secondary = col1.color_picker("سیکنڈری رنگ (کارڈز/سائیڈ بار)", value=shop.get("secondary_color") or DEFAULT_SHOP_THEME["secondary_color"])
 
             if st.button("✅ برانڈنگ محفوظ کریں", type="primary"):
                 conn = get_conn()
@@ -3034,8 +3182,8 @@ def customer_panel(user):
 # ----------------------------- MASTER ADMIN PANEL -----------------------------
 
 def master_admin_panel(user):
-    st.header("👑 ماسٹر ایڈمن پینل")
-    tabs = st.tabs(["🏪 شاپس", "🔑 لائسنس کیز", "📊 مانیٹرنگ", "📢 اعلان (Broadcast)", "🔑 میرا پاسورڈ"])
+    st.header(f"👑 {t('Master Admin Panel')}")
+    tabs = st.tabs([f"🏪 {t('Shops')}", f"🔑 {t('License Keys')}", f"📊 {t('Monitoring')}", f"📢 {t('Broadcast')}", f"🔑 {t('My Password')}"])
 
     with tabs[0]:
         st.subheader("نئی شاپ بنائیں")
@@ -3191,6 +3339,33 @@ def master_admin_panel(user):
 
 # ----------------------------- MAIN -----------------------------
 
+def render_intro_video():
+    """Shows the NABA Tech animated logo intro once per browser session,
+    before the login screen. Browsers block autoplay WITH sound — there is
+    no way around that from any app, native or web — so this uses a real
+    in-iframe Play button; clicking it is a genuine user gesture, so the
+    browser allows sound for that play() call."""
+    with open(_INTRO_VIDEO_PATH, "rb") as f:
+        video_b64 = base64.b64encode(f.read()).decode()
+
+    html = (
+        "<div style='text-align:center;padding:10px;font-family:Poppins,sans-serif;'>"
+        "<video id='naba_intro_vid' width='320' style='border-radius:16px;box-shadow:0 8px 28px rgba(0,0,0,0.28);max-width:90%;' playsinline>"
+        f"<source src='data:video/mp4;base64,{video_b64}' type='video/mp4'>"
+        "</video><br/>"
+        "<button id='naba_play_btn' style='margin-top:16px;padding:12px 30px;background:#3B6EA5;"
+        "color:#fff;border:none;border-radius:10px;font-size:16px;cursor:pointer;'>▶️ انٹرو دیکھیں (Play with Sound)</button>"
+        "</div>"
+        "<script>"
+        "const v=document.getElementById('naba_intro_vid');"
+        "const b=document.getElementById('naba_play_btn');"
+        "b.onclick=function(){v.muted=false;v.play();b.style.display='none';};"
+        "</script>"
+    )
+    components.html(html, height=420)
+    st.button("➡️ لاگ ان پر جائیں (Skip / Continue)", key="skip_intro_btn", use_container_width=True, on_click=lambda: st.session_state.update(intro_shown=True))
+
+
 def main():
     st.set_page_config(page_title="Doodh Delivery System", page_icon="🥛", layout="wide")
     init_db()
@@ -3198,6 +3373,9 @@ def main():
     if "user" not in st.session_state:
         apply_theme()
         render_banner()
+        if intro_video_exists() and not st.session_state.get("intro_shown"):
+            render_intro_video()
+            return
         login_page()
         return
 
