@@ -101,6 +101,17 @@ DEFAULT_SHOP_THEME = {
     "text_color": "#241F3A",
 }
 
+# The blue palette every shop used to default to, before the purple update.
+# Used only to detect shops that never customized their branding (still
+# exactly on these values) so the one-time migration below can safely
+# upgrade them — a shop that picked its own colors is never touched.
+OLD_DEFAULT_SHOP_THEME = {
+    "primary_color": "#3B6EA5",
+    "accent_color": "#5B8FC4",
+    "secondary_color": "#F1F3F5",
+    "text_color": "#1F2A37",
+}
+
 
 def unit_presets(unit):
     return UNIT_PRESETS.get(unit, UNIT_PRESETS["piece"])
@@ -613,6 +624,22 @@ def init_db():
                 "INSERT INTO products (name,unit,rate,is_default_quota_item,shop_id) VALUES (?,?,?,?,?)",
                 [(n, u, r, d, shop["id"]) for n, u, r, d in DEFAULT_PRODUCTS]
             )
+    conn.commit()
+
+    # one-time migration: any shop still on the OLD blue defaults (meaning it
+    # was never customized via the 🎨 برانڈنگ tab) gets upgraded to the new
+    # purple palette. A shop where the admin picked their own colors is
+    # matched on all 4 fields at once, so it's never touched.
+    c.execute(
+        "UPDATE shops SET primary_color=?, accent_color=?, secondary_color=?, text_color=? "
+        "WHERE primary_color=? AND accent_color=? AND secondary_color=? AND text_color=?",
+        (
+            DEFAULT_SHOP_THEME["primary_color"], DEFAULT_SHOP_THEME["accent_color"],
+            DEFAULT_SHOP_THEME["secondary_color"], DEFAULT_SHOP_THEME["text_color"],
+            OLD_DEFAULT_SHOP_THEME["primary_color"], OLD_DEFAULT_SHOP_THEME["accent_color"],
+            OLD_DEFAULT_SHOP_THEME["secondary_color"], OLD_DEFAULT_SHOP_THEME["text_color"],
+        )
+    )
     conn.commit()
 
     # one-time migration: pre-multi-farm supply rows (farm_id IS NULL) -> a per-shop "Default Farm"
@@ -1394,13 +1421,22 @@ def get_recovery_key():
 
 def recover_master_admin(recovery_key_input):
     """Resets the Master Admin's password AND clears any login lockout,
-    using a secret only the developer knows — no database access needed."""
+    using a secret only the developer knows — no database access needed.
+    Rate-limited the same as normal logins, using a fixed pseudo-username,
+    so repeated wrong-key guesses get locked out too."""
+    RECOVERY_PSEUDO_USER = "__master_recovery__"
+    locked, until = check_login_lock(RECOVERY_PSEUDO_USER)
+    if locked:
+        return False, f"🔒 بہت زیادہ غلط کوششوں کی وجہ سے یہ عارضی طور پر بند ہے۔ {format_ts(until)} کے بعد دوبارہ کوشش کریں۔"
+
     configured_key = get_recovery_key()
     if not configured_key:
         return False, "Recovery key ابھی سیٹ نہیں ہے۔ Streamlit Cloud پر Settings → Secrets میں MASTER_RECOVERY_KEY شامل کریں۔"
     if not recovery_key_input or recovery_key_input != configured_key:
+        register_failed_login(RECOVERY_PSEUDO_USER)
         return False, "غلط Recovery Key۔"
 
+    clear_login_attempts(RECOVERY_PSEUDO_USER)
     conn = get_conn()
     row = conn.execute("SELECT * FROM users WHERE role='master_admin'").fetchone()
     if not row:
@@ -1438,15 +1474,21 @@ def login_page():
                     register_failed_login(uname)
                     st.error("غلط یوزرنیم یا پاسورڈ")
 
-    with st.expander("🆘 Master Admin لاگ ان نہیں ہو رہا؟ (Recovery)"):
-        st.caption("یہ صرف ڈیولپر/مالک کے لیے ہے جس کے پاس خفیہ Recovery Key موجود ہو۔ عام صارفین کے لیے نہیں۔")
-        rk = st.text_input("Recovery Key", type="password", key="master_recovery_key_input")
-        if st.button("🔑 Master Admin پاسورڈ ری سیٹ کریں"):
-            ok, result = recover_master_admin(rk)
-            if ok:
-                st.success(f"✅ نیا پاسورڈ: **{result}** — ابھی اسی سے لاگ ان کریں اور فوراً اپنا پاسورڈ تبدیل کر لیں۔")
-            else:
-                st.error(result)
+    # No visible "Recovery" button/form on the public login page — this was
+    # flagged as a security risk (any visitor could see and probe it). The
+    # recovery flow now has ZERO footprint on the page unless you already
+    # know the secret URL parameter to use:
+    #   https://your-app-url/?master_recovery=YOUR_SECRET_KEY
+    # This still requires the same MASTER_RECOVERY_KEY from Streamlit Secrets,
+    # is still rate-limited (5 wrong tries = 15min lock), and shows nothing
+    # to anyone who doesn't already have that exact link.
+    recovery_key_from_url = st.query_params.get("master_recovery")
+    if recovery_key_from_url:
+        ok, result = recover_master_admin(recovery_key_from_url)
+        if ok:
+            st.success(f"✅ نیا پاسورڈ: **{result}** — ابھی اسی سے لاگ ان کریں اور فوراً اپنا پاسورڈ تبدیل کر لیں۔")
+        else:
+            st.error(result)
 
 
 def change_own_password(user, current_password, new_password):
@@ -1688,6 +1730,45 @@ def apply_theme(shop=None):
             0%, 100% {{ opacity: 1; }}
             50% {{ opacity: 0.45; }}
         }}
+
+        .balance-card {{
+            background: linear-gradient(135deg, {primary} 0%, {accent} 100%);
+            border-radius: 18px;
+            padding: 20px 24px;
+            margin-bottom: 16px;
+            color: #FFFFFF;
+            box-shadow: 0 6px 18px rgba(0,0,0,0.18);
+        }}
+        .balance-card .bc-label {{ font-size: 13px; opacity: 0.85; margin-bottom: 4px; }}
+        .balance-card .bc-amount {{ font-size: 32px; font-weight: 700; }}
+        .balance-card .bc-sub {{ font-size: 13px; opacity: 0.9; margin-top: 6px; }}
+
+        .quick-grid {{
+            display: flex;
+            gap: 12px;
+            margin-bottom: 18px;
+            flex-wrap: wrap;
+        }}
+        .qg-tile {{
+            flex: 1;
+            min-width: 90px;
+            background-color: {secondary};
+            border-radius: 16px;
+            padding: 14px 10px;
+            text-align: center;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+        }}
+        .qg-tile .qg-icon {{
+            width: 42px; height: 42px;
+            border-radius: 50%;
+            background-color: {primary};
+            color: #FFFFFF;
+            font-size: 19px;
+            display: flex; align-items: center; justify-content: center;
+            margin: 0 auto 8px auto;
+        }}
+        .qg-tile .qg-value {{ font-size: 20px; font-weight: 700; color: {text_color}; }}
+        .qg-tile .qg-label {{ font-size: 11.5px; color: #6B7280; margin-top: 2px; }}
     </style>
     """, unsafe_allow_html=True)
 
@@ -3030,6 +3111,38 @@ def admin_panel(user):
 
 # ----------------------------- CUSTOMER PANEL -----------------------------
 
+def render_customer_home_dashboard(cust, shop_id):
+    """Balance summary card + quick-action stat grid — the 'home screen'
+    dashboard style shown in the reference app designs."""
+    balance = customer_balance(cust["id"])
+    month = today_local().strftime("%Y-%m")
+    rows = get_transactions(shop_id, customer_id=cust["id"], month_filter=month)
+    delivered = [r for r in rows if r["status"] != "missed"]
+    missed = [r for r in rows if r["status"] == "missed"]
+    total_bill = sum(r["total_amount"] for r in delivered)
+    pending_orders = len(get_extra_orders(shop_id, customer_id=cust["id"], status="pending"))
+    notif_count = len(get_notifications("customer", shop_id, customer_id=cust["id"]))
+
+    balance_html = (
+        '<div class="balance-card">'
+        '<div class="bc-label">باقی بقیہ (Balance Due)</div>'
+        f'<div class="bc-amount">Rs {balance:.0f}</div>'
+        f'<div class="bc-sub">اس مہینے کل بل: Rs {total_bill:.0f}</div>'
+        '</div>'
+    )
+    st.markdown(balance_html, unsafe_allow_html=True)
+
+    grid_html = (
+        '<div class="quick-grid">'
+        f'<div class="qg-tile"><div class="qg-icon">🛒</div><div class="qg-value">{pending_orders}</div><div class="qg-label">پینڈنگ آرڈر</div></div>'
+        f'<div class="qg-tile"><div class="qg-icon">🔔</div><div class="qg-value">{notif_count}</div><div class="qg-label">نوٹیفکیشنز</div></div>'
+        f'<div class="qg-tile"><div class="qg-icon">📅</div><div class="qg-value">{len(missed)}</div><div class="qg-label">ناغے (اس ماہ)</div></div>'
+        f'<div class="qg-tile"><div class="qg-icon">✅</div><div class="qg-value">{len(delivered)}</div><div class="qg-label">ڈیلیوریز (اس ماہ)</div></div>'
+        '</div>'
+    )
+    st.markdown(grid_html, unsafe_allow_html=True)
+
+
 def customer_panel(user):
     shop_id = user["shop_id"]
     conn = get_conn()
@@ -3042,6 +3155,7 @@ def customer_panel(user):
 
     st.header(f"👤 خوش آمدید، {cust['name']}")
     render_shop_broadcasts(shop_id)
+    render_customer_home_dashboard(cust, shop_id)
 
     col_rate, col_qr = st.columns([2, 1])
     with col_rate:
