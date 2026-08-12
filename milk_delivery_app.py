@@ -1,3 +1,28 @@
+import streamlit as st
+
+def check_password():
+    """صارف سے لاگ ان مانگنے کا فنکشن"""
+    if "authenticated" not in st.session_state:
+        st.session_state["authenticated"] = False
+
+    if not st.session_state["authenticated"]:
+        st.title("Login to NABA Dairy Management")
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        
+        if st.button("Login"):
+            # یہاں اپنے ڈیٹا بیس یا Secrets سے پاس ورڈ میچ کریں
+            if username == "admin" and password == "YourSecurePassword123":
+                st.session_state["authenticated"] = True
+                st.rerun()
+            else:
+                st.error("غلط یوزر نیم یا پاس ورڈ")
+        return False
+    return True
+
+# اگر لاگ ان کامیاب ہو تبھی نیچے کا کوڈ چلے گا
+if check_password():
+    st.write("ایپ کی ہوم اسکرین اور باقی تمام فیچرز...")
 """
 Doodh Delivery System — NABA TECH BY KALEEM ULLAH SHARIF
 Roles: Master Admin, Shop Owner/Admin, Rider, Customer
