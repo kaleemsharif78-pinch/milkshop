@@ -1485,6 +1485,15 @@ def login_page():
     recovery_key_from_url = st.query_params.get("master_recovery")
     if recovery_key_from_url:
         ok, result = recover_master_admin(recovery_key_from_url)
+        # Clear the param IMMEDIATELY — Streamlit query params stay in the
+        # browser URL bar across reruns. Without this, the very next rerun
+        # of this page (e.g. submitting the login form itself, or just a
+        # refresh) would silently call recover_master_admin() again and
+        # generate ANOTHER new random password, invalidating the one just
+        # shown. This was the exact bug: "new password shown, but login with
+        # it fails" — because by the time it was used, it had already been
+        # silently replaced.
+        st.query_params.pop("master_recovery", None)
         if ok:
             st.success(f"✅ نیا پاسورڈ: **{result}** — ابھی اسی سے لاگ ان کریں اور فوراً اپنا پاسورڈ تبدیل کر لیں۔")
         else:
